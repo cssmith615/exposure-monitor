@@ -11,21 +11,27 @@ use axum::{
     routing::{get, post},
 };
 use ceem_alerts::build_slack_finding_alert;
-use ceem_auth::{PasswordPolicy, validate_password_policy};
+use ceem_auth::{
+    PasswordPolicy, hash_password, issue_session_token, validate_password_policy, verify_password,
+    verify_session_token,
+};
 use ceem_findings::derive_findings_from_scan_result;
 use ceem_scanner::resolve_dns_baseline;
 use ceem_shared::{
-    Alert, AlertStatus, CreateDomainAssetRequest, CreateDomainAssetResponse,
-    CreateFindingNoteRequest, CreateFindingNoteResponse, CreateOrganizationRequest,
+    AcceptOrganizationInviteResponse, Alert, AlertStatus, CreateDomainAssetRequest,
+    CreateDomainAssetResponse, CreateFindingNoteRequest, CreateFindingNoteResponse,
+    CreateOrganizationInviteRequest, CreateOrganizationInviteResponse, CreateOrganizationRequest,
     CreateOrganizationResponse, CreateRemediationTaskRequest, CreateRemediationTaskResponse,
     CreateScanJobRequest, CreateScanJobResponse, CreateSlackChannelRequest,
     CreateSlackChannelResponse, DeriveFindingsResponse, DomainAsset, Finding, FindingEvent,
-    FindingStatus, HealthResponse, MemberRole, Organization, OrganizationMembership,
-    OrganizationSummary, PRODUCT_NAME, QueueSlackAlertResponse, RegisterUserRequest,
-    RegisterUserResponse, RemediationStatus, RemediationTask, RunDnsBaselineScanResponse,
-    ScanEvidence, ScanJob, ScanResult, ScanStatus, ServiceStatus, SlackNotificationChannel,
-    UpdateFindingStatusRequest, UpdateFindingStatusResponse, UpdateRemediationStatusRequest,
-    UpdateRemediationStatusResponse, UserAccount, validate_domain, validate_slug,
+    FindingStatus, HealthResponse, LoginRequest, LoginResponse, MemberRole, Organization,
+    OrganizationInvite, OrganizationMember, OrganizationMembership, OrganizationSummary,
+    PRODUCT_NAME, QueueSlackAlertResponse, RegisterUserRequest, RegisterUserResponse,
+    RemediationStatus, RemediationTask, RunDnsBaselineScanResponse, ScanEvidence, ScanJob,
+    ScanResult, ScanStatus, ServiceStatus, SessionToken, SlackNotificationChannel,
+    UpdateFindingStatusRequest, UpdateFindingStatusResponse, UpdateMemberRoleRequest,
+    UpdateMemberRoleResponse, UpdateRemediationStatusRequest, UpdateRemediationStatusResponse,
+    UserAccount, validate_domain, validate_slug,
 };
 use chrono::Utc;
 use serde::Serialize;
@@ -53,9 +59,26 @@ fn app() -> Router {
     Router::new()
         .route("/healthz", get(healthz))
         .route("/v1/auth/register", post(register_user))
+        .route("/v1/auth/login", post(login_user))
         .route(
             "/v1/organizations",
             post(create_organization).get(list_organizations),
+        )
+        .route(
+            "/v1/organizations/{organization_id}/members",
+            get(list_organization_members),
+        )
+        .route(
+            "/v1/organizations/{organization_id}/members/{member_user_id}/role",
+            post(update_member_role),
+        )
+        .route(
+            "/v1/organizations/{organization_id}/invites",
+            post(create_organization_invite),
+        )
+        .route(
+            "/v1/organization-invites/{token}/accept",
+            post(accept_organization_invite),
         )
         .route(
             "/v1/organizations/{organization_id}/domain-assets",
@@ -150,9 +173,11 @@ impl FromRef<AppState> for Arc<Mutex<InMemoryRepository>> {
 struct InMemoryRepository {
     users_by_id: HashMap<Uuid, UserAccount>,
     user_ids_by_email: HashMap<String, Uuid>,
+    password_hashes_by_user_id: HashMap<Uuid, String>,
     organizations_by_id: HashMap<Uuid, Organization>,
     organization_ids_by_slug: HashMap<String, Uuid>,
     memberships: Vec<OrganizationMembership>,
+    organization_invites_by_token: HashMap<String, OrganizationInvite>,
     domain_assets_by_id: HashMap<Uuid, DomainAsset>,
     domain_asset_ids_by_org_domain: HashMap<(Uuid, String), Uuid>,
     scan_jobs_by_id: HashMap<Uuid, ScanJob>,
@@ -174,6 +199,7 @@ async fn register_user(
     let display_name = validate_display_name(&request.display_name)?;
     validate_password_policy(&request.password, &PasswordPolicy::default())
         .map_err(|error| ApiError::bad_request(error.to_string()))?;
+    let password_hash = hash_password(&request.password).map_err(|_| ApiError::internal())?;
 
     let mut repository = repository.lock().map_err(|_| ApiError::internal())?;
 
@@ -189,9 +215,44 @@ async fn register_user(
     };
 
     repository.user_ids_by_email.insert(email, user.id);
+    repository
+        .password_hashes_by_user_id
+        .insert(user.id, password_hash);
     repository.users_by_id.insert(user.id, user.clone());
 
-    Ok(Json(RegisterUserResponse { user }))
+    let session = session_for_user(user.id)?;
+
+    Ok(Json(RegisterUserResponse { user, session }))
+}
+
+async fn login_user(
+    State(repository): State<Arc<Mutex<InMemoryRepository>>>,
+    Json(request): Json<LoginRequest>,
+) -> Result<Json<LoginResponse>, ApiError> {
+    let email = normalize_email(&request.email)?;
+    let repository = repository.lock().map_err(|_| ApiError::internal())?;
+    let user_id = repository
+        .user_ids_by_email
+        .get(&email)
+        .copied()
+        .ok_or_else(|| ApiError::unauthorized("email or password is incorrect"))?;
+    let password_hash = repository
+        .password_hashes_by_user_id
+        .get(&user_id)
+        .ok_or_else(ApiError::internal)?;
+
+    if !verify_password(&request.password, password_hash).map_err(|_| ApiError::internal())? {
+        return Err(ApiError::unauthorized("email or password is incorrect"));
+    }
+
+    let user = repository
+        .users_by_id
+        .get(&user_id)
+        .cloned()
+        .ok_or_else(ApiError::internal)?;
+    let session = session_for_user(user.id)?;
+
+    Ok(Json(LoginResponse { user, session }))
 }
 
 async fn create_organization(
@@ -269,6 +330,168 @@ async fn list_organizations(
         .collect();
 
     Ok(Json(organizations))
+}
+
+async fn list_organization_members(
+    State(repository): State<Arc<Mutex<InMemoryRepository>>>,
+    headers: HeaderMap,
+    Path(organization_id): Path<Uuid>,
+) -> Result<Json<Vec<OrganizationMember>>, ApiError> {
+    let user_id = current_user_id(&headers)?;
+    let repository = repository.lock().map_err(|_| ApiError::internal())?;
+    repository.require_membership(user_id, organization_id)?;
+
+    let mut members = repository
+        .memberships
+        .iter()
+        .filter(|membership| membership.organization_id == organization_id)
+        .filter_map(|membership| {
+            repository
+                .users_by_id
+                .get(&membership.user_id)
+                .map(|user| OrganizationMember {
+                    user: user.clone(),
+                    role: membership.role,
+                    created_at: membership.created_at,
+                })
+        })
+        .collect::<Vec<_>>();
+
+    members.sort_by(|left, right| left.user.email.cmp(&right.user.email));
+
+    Ok(Json(members))
+}
+
+async fn create_organization_invite(
+    State(repository): State<Arc<Mutex<InMemoryRepository>>>,
+    headers: HeaderMap,
+    Path(organization_id): Path<Uuid>,
+    Json(request): Json<CreateOrganizationInviteRequest>,
+) -> Result<Json<CreateOrganizationInviteResponse>, ApiError> {
+    let user_id = current_user_id(&headers)?;
+    let email = normalize_email(&request.email)?;
+    let mut repository = repository.lock().map_err(|_| ApiError::internal())?;
+    let role = repository.require_membership(user_id, organization_id)?;
+
+    if !matches!(role, MemberRole::Owner | MemberRole::Admin) {
+        return Err(ApiError::forbidden(
+            "only organization owners and admins can invite members",
+        ));
+    }
+
+    if matches!(request.role, MemberRole::Owner) && !matches!(role, MemberRole::Owner) {
+        return Err(ApiError::forbidden("only owners can invite another owner"));
+    }
+
+    let invite = OrganizationInvite {
+        id: Uuid::now_v7(),
+        organization_id,
+        email,
+        role: request.role,
+        token: Uuid::now_v7().to_string(),
+        invited_by: user_id,
+        accepted_at: None,
+        created_at: Utc::now(),
+    };
+
+    repository
+        .organization_invites_by_token
+        .insert(invite.token.clone(), invite.clone());
+
+    Ok(Json(CreateOrganizationInviteResponse { invite }))
+}
+
+async fn accept_organization_invite(
+    State(repository): State<Arc<Mutex<InMemoryRepository>>>,
+    headers: HeaderMap,
+    Path(token): Path<String>,
+) -> Result<Json<AcceptOrganizationInviteResponse>, ApiError> {
+    let user_id = current_user_id(&headers)?;
+    let mut repository = repository.lock().map_err(|_| ApiError::internal())?;
+    let user = repository
+        .users_by_id
+        .get(&user_id)
+        .cloned()
+        .ok_or_else(|| ApiError::unauthorized("user does not exist"))?;
+    let invite = repository
+        .organization_invites_by_token
+        .get_mut(&token)
+        .ok_or_else(|| ApiError::not_found("organization invite does not exist"))?;
+
+    if invite.accepted_at.is_some() {
+        return Err(ApiError::conflict(
+            "organization invite has already been accepted",
+        ));
+    }
+
+    if invite.email != user.email {
+        return Err(ApiError::forbidden(
+            "organization invite belongs to a different email address",
+        ));
+    }
+
+    invite.accepted_at = Some(Utc::now());
+    let invite = invite.clone();
+    let membership = OrganizationMembership {
+        organization_id: invite.organization_id,
+        user_id,
+        role: invite.role,
+        created_at: Utc::now(),
+    };
+
+    if let Some(existing) = repository.memberships.iter_mut().find(|membership| {
+        membership.organization_id == invite.organization_id && membership.user_id == user_id
+    }) {
+        existing.role = invite.role;
+    } else {
+        repository.memberships.push(membership.clone());
+    }
+
+    let organization = repository
+        .organizations_by_id
+        .get(&invite.organization_id)
+        .cloned()
+        .ok_or_else(ApiError::internal)?;
+
+    Ok(Json(AcceptOrganizationInviteResponse {
+        organization,
+        membership,
+    }))
+}
+
+async fn update_member_role(
+    State(repository): State<Arc<Mutex<InMemoryRepository>>>,
+    headers: HeaderMap,
+    Path((organization_id, member_user_id)): Path<(Uuid, Uuid)>,
+    Json(request): Json<UpdateMemberRoleRequest>,
+) -> Result<Json<UpdateMemberRoleResponse>, ApiError> {
+    let user_id = current_user_id(&headers)?;
+    let mut repository = repository.lock().map_err(|_| ApiError::internal())?;
+    let actor_role = repository.require_membership(user_id, organization_id)?;
+
+    if !matches!(actor_role, MemberRole::Owner | MemberRole::Admin) {
+        return Err(ApiError::forbidden(
+            "only organization owners and admins can update member roles",
+        ));
+    }
+
+    if matches!(request.role, MemberRole::Owner) && !matches!(actor_role, MemberRole::Owner) {
+        return Err(ApiError::forbidden("only owners can assign owner role"));
+    }
+
+    let membership = repository
+        .memberships
+        .iter_mut()
+        .find(|membership| {
+            membership.organization_id == organization_id && membership.user_id == member_user_id
+        })
+        .ok_or_else(|| ApiError::not_found("organization member does not exist"))?;
+
+    membership.role = request.role;
+
+    Ok(Json(UpdateMemberRoleResponse {
+        membership: membership.clone(),
+    }))
 }
 
 async fn create_domain_asset(
@@ -1088,7 +1311,39 @@ fn validate_scan_reason(input: Option<String>) -> Result<Option<String>, ApiErro
     Ok(Some(reason.to_string()))
 }
 
+fn session_for_user(user_id: Uuid) -> Result<SessionToken, ApiError> {
+    const SESSION_TTL_SECONDS: i64 = 60 * 60 * 8;
+    let access_token =
+        issue_session_token(user_id, session_secret().as_bytes(), SESSION_TTL_SECONDS)
+            .map_err(|_| ApiError::internal())?;
+
+    Ok(SessionToken {
+        access_token,
+        token_type: "Bearer".to_string(),
+        expires_in_seconds: SESSION_TTL_SECONDS,
+    })
+}
+
+fn session_secret() -> String {
+    std::env::var("CEEM_SESSION_SECRET")
+        .unwrap_or_else(|_| "dev-only-change-me-before-production".to_string())
+}
+
 fn current_user_id(headers: &HeaderMap) -> Result<Uuid, ApiError> {
+    if let Some(value) = headers.get("authorization") {
+        let value = value
+            .to_str()
+            .map_err(|_| ApiError::unauthorized("authorization header must be valid UTF-8"))?;
+        let Some(token) = value.strip_prefix("Bearer ") else {
+            return Err(ApiError::unauthorized(
+                "authorization header must use Bearer token",
+            ));
+        };
+
+        return verify_session_token(token, session_secret().as_bytes())
+            .map_err(|_| ApiError::unauthorized("session token is invalid or expired"));
+    }
+
     let value = headers
         .get("x-ceem-user-id")
         .ok_or_else(|| ApiError::unauthorized("x-ceem-user-id header is required"))?;

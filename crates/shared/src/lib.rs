@@ -149,6 +149,13 @@ pub struct OrganizationMembership {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct OrganizationMember {
+    pub user: UserAccount,
+    pub role: MemberRole,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct OrganizationSummary {
     pub organization: Organization,
     pub role: MemberRole,
@@ -164,6 +171,26 @@ pub struct RegisterUserRequest {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RegisterUserResponse {
     pub user: UserAccount,
+    pub session: SessionToken,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LoginRequest {
+    pub email: String,
+    pub password: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LoginResponse {
+    pub user: UserAccount,
+    pub session: SessionToken,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SessionToken {
+    pub access_token: String,
+    pub token_type: String,
+    pub expires_in_seconds: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -175,6 +202,45 @@ pub struct CreateOrganizationRequest {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CreateOrganizationResponse {
     pub organization: Organization,
+    pub membership: OrganizationMembership,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct OrganizationInvite {
+    pub id: Uuid,
+    pub organization_id: Uuid,
+    pub email: String,
+    pub role: MemberRole,
+    pub token: String,
+    pub invited_by: Uuid,
+    pub accepted_at: Option<DateTime<Utc>>,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CreateOrganizationInviteRequest {
+    pub email: String,
+    pub role: MemberRole,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CreateOrganizationInviteResponse {
+    pub invite: OrganizationInvite,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AcceptOrganizationInviteResponse {
+    pub organization: Organization,
+    pub membership: OrganizationMembership,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct UpdateMemberRoleRequest {
+    pub role: MemberRole,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct UpdateMemberRoleResponse {
     pub membership: OrganizationMembership,
 }
 
