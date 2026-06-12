@@ -1,4 +1,5 @@
 use std::{
+    cmp::Reverse,
     collections::HashMap,
     sync::{Arc, Mutex},
 };
@@ -667,7 +668,7 @@ async fn list_scan_jobs(
         .cloned()
         .collect::<Vec<_>>();
 
-    scan_jobs.sort_by(|left, right| right.created_at.cmp(&left.created_at));
+    scan_jobs.sort_by_key(|scan_job| Reverse(scan_job.created_at));
 
     Ok(Json(scan_jobs))
 }
@@ -910,7 +911,7 @@ async fn list_scan_results(
         .cloned()
         .collect::<Vec<_>>();
 
-    scan_results.sort_by(|left, right| right.observed_at.cmp(&left.observed_at));
+    scan_results.sort_by_key(|scan_result| Reverse(scan_result.observed_at));
 
     Ok(Json(scan_results))
 }
@@ -1007,7 +1008,7 @@ async fn list_findings(
         .cloned()
         .collect::<Vec<_>>();
 
-    findings.sort_by(|left, right| right.last_seen_at.cmp(&left.last_seen_at));
+    findings.sort_by_key(|finding| Reverse(finding.last_seen_at));
 
     Ok(Json(findings))
 }
@@ -1142,7 +1143,7 @@ async fn list_finding_notes(
         .cloned()
         .collect::<Vec<_>>();
 
-    events.sort_by(|left, right| right.created_at.cmp(&left.created_at));
+    events.sort_by_key(|event| Reverse(event.created_at));
 
     Ok(Json(events))
 }
@@ -1288,7 +1289,7 @@ async fn list_alerts(
         .cloned()
         .collect::<Vec<_>>();
 
-    alerts.sort_by(|left, right| right.created_at.cmp(&left.created_at));
+    alerts.sort_by_key(|alert| Reverse(alert.created_at));
 
     Ok(Json(alerts))
 }
@@ -1453,7 +1454,7 @@ async fn list_remediation_tasks(
         .cloned()
         .collect::<Vec<_>>();
 
-    tasks.sort_by(|left, right| right.updated_at.cmp(&left.updated_at));
+    tasks.sort_by_key(|task| Reverse(task.updated_at));
 
     Ok(Json(tasks))
 }
@@ -1523,7 +1524,7 @@ async fn list_audit_logs(
         .cloned()
         .collect::<Vec<_>>();
 
-    logs.sort_by(|left, right| right.created_at.cmp(&left.created_at));
+    logs.sort_by_key(|log| Reverse(log.created_at));
 
     Ok(Json(logs))
 }
