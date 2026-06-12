@@ -97,3 +97,11 @@ Minimum:
 Later:
 
 - Metrics for scan latency, findings by severity, alert failure rate, and queue depth.
+
+## Future CEEM Agent
+
+The future `ceem-agent` extends CEEM into approved Linux host inventory. It should be a Rust binary packaged for RHEL first, running as a systemd service with enrollment, heartbeat, scoped jobs, and a local policy cache.
+
+The control plane will add agent enrollment, agent identity, agent jobs, and agent events while preserving the same approval-first safety model used for external scans.
+
+See [CEEM Agent and AI-Native Roadmap](ceem-agent-rhel-ai-native.md).

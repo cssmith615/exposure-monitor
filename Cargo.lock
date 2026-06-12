@@ -206,12 +206,14 @@ dependencies = [
  "axum",
  "ceem-alerts",
  "ceem-auth",
+ "ceem-db",
  "ceem-findings",
  "ceem-scanner",
  "ceem-shared",
  "chrono",
  "serde",
  "serde_json",
+ "sqlx",
  "tokio",
  "tower-http",
  "tracing",
@@ -284,9 +286,17 @@ name = "ceem-worker"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "ceem-db",
+ "ceem-findings",
+ "ceem-scanner",
+ "ceem-shared",
+ "chrono",
+ "serde_json",
+ "sqlx",
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "uuid",
 ]
 
 [[package]]

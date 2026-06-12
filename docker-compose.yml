@@ -16,5 +16,47 @@ services:
       timeout: 5s
       retries: 5
 
+  api:
+    build:
+      context: .
+      dockerfile: crates/api/Dockerfile
+    container_name: ceem-api
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      CEEM_BIND_ADDR: 0.0.0.0:8080
+      DATABASE_URL: postgres://ceem:ceem@postgres:5432/ceem
+      CEEM_SESSION_SECRET: ${CEEM_SESSION_SECRET:-dev-only-change-me-before-production}
+      RUST_LOG: ${RUST_LOG:-info}
+    ports:
+      - "8080:8080"
+
+  worker:
+    build:
+      context: .
+      dockerfile: crates/worker/Dockerfile
+    container_name: ceem-worker
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgres://ceem:ceem@postgres:5432/ceem
+      CEEM_SESSION_SECRET: ${CEEM_SESSION_SECRET:-dev-only-change-me-before-production}
+      CEEM_WORKER_POLL_SECONDS: ${CEEM_WORKER_POLL_SECONDS:-15}
+      RUST_LOG: ${RUST_LOG:-info}
+
+  web:
+    build:
+      context: .
+      dockerfile: web/Dockerfile
+      args:
+        VITE_CEEM_API_URL: ${VITE_CEEM_API_URL:-http://localhost:8080}
+    container_name: ceem-web
+    depends_on:
+      - api
+    ports:
+      - "5317:80"
+
 volumes:
   ceem-postgres-data:

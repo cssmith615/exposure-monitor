@@ -1,9 +1,3 @@
-use std::{
-    cmp::Reverse,
-    collections::HashMap,
-    sync::{Arc, Mutex},
-};
-
 use axum::{
     Json, Router,
     extract::{FromRef, Path, State},
@@ -16,27 +10,29 @@ use ceem_auth::{
     PasswordPolicy, hash_password, issue_session_token, validate_password_policy, verify_password,
     verify_session_token,
 };
+use ceem_db::{DatabaseConfig, PostgresRepository};
 use ceem_findings::derive_findings_from_scan_result;
 use ceem_scanner::{collect_dns_policy_baseline, probe_http_endpoint, resolve_dns_baseline};
 use ceem_shared::{
-    AcceptOrganizationInviteResponse, Alert, AlertStatus, AuditLog, CreateDomainAssetRequest,
-    CreateDomainAssetResponse, CreateFindingNoteRequest, CreateFindingNoteResponse,
-    CreateOrganizationInviteRequest, CreateOrganizationInviteResponse, CreateOrganizationRequest,
-    CreateOrganizationResponse, CreateRemediationTaskRequest, CreateRemediationTaskResponse,
-    CreateScanJobRequest, CreateScanJobResponse, CreateSlackChannelRequest,
-    CreateSlackChannelResponse, DeriveFindingsResponse, DomainAsset, Finding, FindingEvent,
-    FindingStatus, HealthResponse, LoginRequest, LoginResponse, MemberRole, Organization,
-    OrganizationInvite, OrganizationMember, OrganizationMembership, OrganizationSummary,
-    PRODUCT_NAME, QueueSlackAlertResponse, RegisterUserRequest, RegisterUserResponse,
-    RemediationStatus, RemediationTask, RunDnsBaselineScanResponse, ScanEvidence, ScanJob,
-    ScanResult, ScanStatus, ServiceStatus, SessionToken, SlackNotificationChannel,
-    UpdateFindingStatusRequest, UpdateFindingStatusResponse, UpdateMemberRoleRequest,
-    UpdateMemberRoleResponse, UpdateRemediationStatusRequest, UpdateRemediationStatusResponse,
-    UserAccount, validate_domain, validate_slug,
+    AcceptOrganizationInviteResponse, Alert, AlertStatus, AuditLog, Confidence,
+    CreateDomainAssetRequest, CreateDomainAssetResponse, CreateFindingNoteRequest,
+    CreateFindingNoteResponse, CreateOrganizationInviteRequest, CreateOrganizationInviteResponse,
+    CreateOrganizationRequest, CreateOrganizationResponse, CreateRemediationTaskRequest,
+    CreateRemediationTaskResponse, CreateScanJobRequest, CreateScanJobResponse,
+    CreateSlackChannelRequest, CreateSlackChannelResponse, DeriveFindingsResponse, DomainAsset,
+    Finding, FindingEvent, FindingStatus, HealthResponse, LoginRequest, LoginResponse, MemberRole,
+    Organization, OrganizationInvite, OrganizationMember, OrganizationMembership,
+    OrganizationSummary, PRODUCT_NAME, QueueSlackAlertResponse, RegisterUserRequest,
+    RegisterUserResponse, RemediationStatus, RemediationTask, RunDnsBaselineScanResponse,
+    ScanEvidence, ScanJob, ScanResult, ScanStatus, ServiceStatus, SessionToken, Severity,
+    SlackNotificationChannel, UpdateFindingStatusRequest, UpdateFindingStatusResponse,
+    UpdateMemberRoleRequest, UpdateMemberRoleResponse, UpdateRemediationStatusRequest,
+    UpdateRemediationStatusResponse, UserAccount, validate_domain, validate_slug,
 };
 use chrono::Utc;
 use serde::Serialize;
 use serde_json::{Value, json};
+use sqlx::{PgPool, Row, postgres::PgRow};
 use tower_http::{cors::CorsLayer, trace::TraceLayer};
 use tracing::info;
 use tracing_subscriber::{EnvFilter, fmt};
@@ -46,17 +42,20 @@ use uuid::Uuid;
 async fn main() -> anyhow::Result<()> {
     init_tracing();
 
+    let repository = PostgresRepository::connect(&DatabaseConfig::from_env()?).await?;
+    repository.migrate().await?;
+
     let bind_addr =
         std::env::var("CEEM_BIND_ADDR").unwrap_or_else(|_| "127.0.0.1:8080".to_string());
     let listener = tokio::net::TcpListener::bind(&bind_addr).await?;
     info!(%bind_addr, "starting CEEM API");
 
-    axum::serve(listener, app()).await?;
+    axum::serve(listener, app(repository.pool().clone())).await?;
     Ok(())
 }
 
-fn app() -> Router {
-    let state = AppState::default();
+fn app(pool: PgPool) -> Router {
+    let state = AppState { pool };
 
     Router::new()
         .route("/healthz", get(healthz))
@@ -176,42 +175,19 @@ fn init_tracing() {
     fmt().with_env_filter(filter).json().init();
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone)]
 struct AppState {
-    repository: Arc<Mutex<InMemoryRepository>>,
+    pool: PgPool,
 }
 
-impl FromRef<AppState> for Arc<Mutex<InMemoryRepository>> {
+impl FromRef<AppState> for PgPool {
     fn from_ref(state: &AppState) -> Self {
-        Arc::clone(&state.repository)
+        state.pool.clone()
     }
 }
 
-#[derive(Default)]
-struct InMemoryRepository {
-    users_by_id: HashMap<Uuid, UserAccount>,
-    user_ids_by_email: HashMap<String, Uuid>,
-    password_hashes_by_user_id: HashMap<Uuid, String>,
-    organizations_by_id: HashMap<Uuid, Organization>,
-    organization_ids_by_slug: HashMap<String, Uuid>,
-    memberships: Vec<OrganizationMembership>,
-    organization_invites_by_token: HashMap<String, OrganizationInvite>,
-    domain_assets_by_id: HashMap<Uuid, DomainAsset>,
-    domain_asset_ids_by_org_domain: HashMap<(Uuid, String), Uuid>,
-    scan_jobs_by_id: HashMap<Uuid, ScanJob>,
-    scan_results_by_id: HashMap<Uuid, ScanResult>,
-    findings_by_id: HashMap<Uuid, Finding>,
-    finding_ids_by_asset_rule: HashMap<(Uuid, String), Uuid>,
-    finding_events_by_id: HashMap<Uuid, FindingEvent>,
-    slack_channels_by_id: HashMap<Uuid, SlackNotificationChannel>,
-    slack_secret_refs_by_id: HashMap<Uuid, String>,
-    alerts_by_id: HashMap<Uuid, Alert>,
-    remediation_tasks_by_id: HashMap<Uuid, RemediationTask>,
-    audit_logs_by_id: HashMap<Uuid, AuditLog>,
-}
-
 async fn register_user(
-    State(repository): State<Arc<Mutex<InMemoryRepository>>>,
+    State(pool): State<PgPool>,
     Json(request): Json<RegisterUserRequest>,
 ) -> Result<Json<RegisterUserResponse>, ApiError> {
     let email = normalize_email(&request.email)?;
@@ -220,1394 +196,1807 @@ async fn register_user(
         .map_err(|error| ApiError::bad_request(error.to_string()))?;
     let password_hash = hash_password(&request.password).map_err(|_| ApiError::internal())?;
 
-    let mut repository = repository.lock().map_err(|_| ApiError::internal())?;
-
-    if repository.user_ids_by_email.contains_key(&email) {
+    if find_user_by_email(&pool, &email).await?.is_some() {
         return Err(ApiError::conflict("email is already registered"));
     }
 
-    let user = UserAccount {
-        id: Uuid::now_v7(),
-        email: email.clone(),
-        display_name,
-        created_at: Utc::now(),
-    };
+    let row = sqlx::query(
+        r#"
+        INSERT INTO users (id, email, display_name, password_hash)
+        VALUES ($1, $2, $3, $4)
+        RETURNING id, email, display_name, created_at
+        "#,
+    )
+    .bind(Uuid::now_v7())
+    .bind(email)
+    .bind(display_name)
+    .bind(password_hash)
+    .fetch_one(&pool)
+    .await
+    .map_err(map_sql_error)?;
 
-    repository.user_ids_by_email.insert(email, user.id);
-    repository
-        .password_hashes_by_user_id
-        .insert(user.id, password_hash);
-    repository.users_by_id.insert(user.id, user.clone());
-
+    let user = user_from_row(&row);
     let session = session_for_user(user.id)?;
 
     Ok(Json(RegisterUserResponse { user, session }))
 }
 
 async fn login_user(
-    State(repository): State<Arc<Mutex<InMemoryRepository>>>,
+    State(pool): State<PgPool>,
     Json(request): Json<LoginRequest>,
 ) -> Result<Json<LoginResponse>, ApiError> {
     let email = normalize_email(&request.email)?;
-    let repository = repository.lock().map_err(|_| ApiError::internal())?;
-    let user_id = repository
-        .user_ids_by_email
-        .get(&email)
-        .copied()
+    let (user, password_hash) = find_user_by_email(&pool, &email)
+        .await?
         .ok_or_else(|| ApiError::unauthorized("email or password is incorrect"))?;
-    let password_hash = repository
-        .password_hashes_by_user_id
-        .get(&user_id)
-        .ok_or_else(ApiError::internal)?;
 
-    if !verify_password(&request.password, password_hash).map_err(|_| ApiError::internal())? {
+    if !verify_password(&request.password, &password_hash).map_err(|_| ApiError::internal())? {
         return Err(ApiError::unauthorized("email or password is incorrect"));
     }
 
-    let user = repository
-        .users_by_id
-        .get(&user_id)
-        .cloned()
-        .ok_or_else(ApiError::internal)?;
     let session = session_for_user(user.id)?;
 
     Ok(Json(LoginResponse { user, session }))
 }
 
 async fn create_organization(
-    State(repository): State<Arc<Mutex<InMemoryRepository>>>,
+    State(pool): State<PgPool>,
     headers: HeaderMap,
     Json(request): Json<CreateOrganizationRequest>,
 ) -> Result<Json<CreateOrganizationResponse>, ApiError> {
     let user_id = current_user_id(&headers)?;
+    require_user(&pool, user_id).await?;
     let name = validate_organization_name(&request.name)?;
     let slug =
         validate_slug(&request.slug).map_err(|error| ApiError::bad_request(error.to_string()))?;
 
-    let mut repository = repository.lock().map_err(|_| ApiError::internal())?;
-
-    if !repository.users_by_id.contains_key(&user_id) {
-        return Err(ApiError::unauthorized("user does not exist"));
-    }
-
-    if repository.organization_ids_by_slug.contains_key(&slug) {
+    if organization_by_slug(&pool, &slug).await?.is_some() {
         return Err(ApiError::conflict("organization slug is already taken"));
     }
 
-    let now = Utc::now();
-    let organization = Organization {
-        id: Uuid::now_v7(),
-        name,
-        slug: slug.clone(),
-        created_at: now,
-    };
-    let membership = OrganizationMembership {
-        organization_id: organization.id,
-        user_id,
-        role: MemberRole::Owner,
-        created_at: now,
-    };
-
-    repository
-        .organization_ids_by_slug
-        .insert(slug, organization.id);
-    repository
-        .organizations_by_id
-        .insert(organization.id, organization.clone());
-    repository.memberships.push(membership.clone());
+    let mut transaction = pool.begin().await.map_err(map_sql_error)?;
+    let organization_row = sqlx::query(
+        r#"
+        INSERT INTO organizations (id, name, slug)
+        VALUES ($1, $2, $3)
+        RETURNING id, name, slug, created_at
+        "#,
+    )
+    .bind(Uuid::now_v7())
+    .bind(name)
+    .bind(slug)
+    .fetch_one(&mut *transaction)
+    .await
+    .map_err(map_sql_error)?;
+    let organization = organization_from_row(&organization_row);
+    let membership_row = sqlx::query(
+        r#"
+        INSERT INTO organization_members (organization_id, user_id, role)
+        VALUES ($1, $2, $3::member_role)
+        RETURNING organization_id, user_id, role::text AS role, created_at
+        "#,
+    )
+    .bind(organization.id)
+    .bind(user_id)
+    .bind(member_role_slug(MemberRole::Owner))
+    .fetch_one(&mut *transaction)
+    .await
+    .map_err(map_sql_error)?;
+    transaction.commit().await.map_err(map_sql_error)?;
 
     Ok(Json(CreateOrganizationResponse {
         organization,
-        membership,
+        membership: membership_from_row(&membership_row),
     }))
 }
 
 async fn list_organizations(
-    State(repository): State<Arc<Mutex<InMemoryRepository>>>,
+    State(pool): State<PgPool>,
     headers: HeaderMap,
 ) -> Result<Json<Vec<OrganizationSummary>>, ApiError> {
     let user_id = current_user_id(&headers)?;
-    let repository = repository.lock().map_err(|_| ApiError::internal())?;
+    require_user(&pool, user_id).await?;
+    let rows = sqlx::query(
+        r#"
+        SELECT
+            organizations.id,
+            organizations.name,
+            organizations.slug,
+            organizations.created_at,
+            organization_members.role::text AS role
+        FROM organization_members
+        INNER JOIN organizations ON organizations.id = organization_members.organization_id
+        WHERE organization_members.user_id = $1
+        ORDER BY organizations.name ASC
+        "#,
+    )
+    .bind(user_id)
+    .fetch_all(&pool)
+    .await
+    .map_err(map_sql_error)?;
 
-    if !repository.users_by_id.contains_key(&user_id) {
-        return Err(ApiError::unauthorized("user does not exist"));
-    }
-
-    let organizations = repository
-        .memberships
-        .iter()
-        .filter(|membership| membership.user_id == user_id)
-        .filter_map(|membership| {
-            repository
-                .organizations_by_id
-                .get(&membership.organization_id)
-                .map(|organization| OrganizationSummary {
-                    organization: organization.clone(),
-                    role: membership.role,
-                })
-        })
-        .collect();
-
-    Ok(Json(organizations))
+    Ok(Json(
+        rows.iter()
+            .map(|row| OrganizationSummary {
+                organization: organization_from_row(row),
+                role: parse_member_role(row.get("role")),
+            })
+            .collect(),
+    ))
 }
 
 async fn list_organization_members(
-    State(repository): State<Arc<Mutex<InMemoryRepository>>>,
+    State(pool): State<PgPool>,
     headers: HeaderMap,
     Path(organization_id): Path<Uuid>,
 ) -> Result<Json<Vec<OrganizationMember>>, ApiError> {
     let user_id = current_user_id(&headers)?;
-    let repository = repository.lock().map_err(|_| ApiError::internal())?;
-    repository.require_membership(user_id, organization_id)?;
-
-    let mut members = repository
-        .memberships
-        .iter()
-        .filter(|membership| membership.organization_id == organization_id)
-        .filter_map(|membership| {
-            repository
-                .users_by_id
-                .get(&membership.user_id)
-                .map(|user| OrganizationMember {
-                    user: user.clone(),
-                    role: membership.role,
-                    created_at: membership.created_at,
-                })
-        })
-        .collect::<Vec<_>>();
-
-    members.sort_by(|left, right| left.user.email.cmp(&right.user.email));
-
-    Ok(Json(members))
+    require_membership(&pool, user_id, organization_id).await?;
+    Ok(Json(list_members(&pool, organization_id).await?))
 }
 
 async fn create_organization_invite(
-    State(repository): State<Arc<Mutex<InMemoryRepository>>>,
+    State(pool): State<PgPool>,
     headers: HeaderMap,
     Path(organization_id): Path<Uuid>,
     Json(request): Json<CreateOrganizationInviteRequest>,
 ) -> Result<Json<CreateOrganizationInviteResponse>, ApiError> {
     let user_id = current_user_id(&headers)?;
-    let email = normalize_email(&request.email)?;
-    let mut repository = repository.lock().map_err(|_| ApiError::internal())?;
-    let role = repository.require_membership(user_id, organization_id)?;
-
+    let role = require_membership(&pool, user_id, organization_id).await?;
     if !matches!(role, MemberRole::Owner | MemberRole::Admin) {
         return Err(ApiError::forbidden(
             "only organization owners and admins can invite members",
         ));
     }
-
     if matches!(request.role, MemberRole::Owner) && !matches!(role, MemberRole::Owner) {
         return Err(ApiError::forbidden("only owners can invite another owner"));
     }
 
-    let invite = OrganizationInvite {
-        id: Uuid::now_v7(),
-        organization_id,
-        email,
-        role: request.role,
-        token: Uuid::now_v7().to_string(),
-        invited_by: user_id,
-        accepted_at: None,
-        created_at: Utc::now(),
-    };
+    let email = normalize_email(&request.email)?;
+    let token = Uuid::now_v7().to_string();
+    let row = sqlx::query(
+        r#"
+        INSERT INTO organization_invites
+            (id, organization_id, email, role, token_hash, invited_by)
+        VALUES ($1, $2, $3, $4::member_role, $5, $6)
+        RETURNING id, organization_id, email, role::text AS role, token_hash, invited_by,
+            accepted_at, created_at
+        "#,
+    )
+    .bind(Uuid::now_v7())
+    .bind(organization_id)
+    .bind(email)
+    .bind(member_role_slug(request.role))
+    .bind(&token)
+    .bind(user_id)
+    .fetch_one(&pool)
+    .await
+    .map_err(map_sql_error)?;
 
-    repository
-        .organization_invites_by_token
-        .insert(invite.token.clone(), invite.clone());
+    let mut invite = invite_from_row(&row);
+    invite.token = token;
+    record_audit(
+        &pool,
+        Some(organization_id),
+        Some(user_id),
+        "organization.invite_created",
+        "organization_invite",
+        Some(invite.id),
+        json!({ "email": invite.email, "role": member_role_slug(invite.role) }),
+    )
+    .await?;
 
     Ok(Json(CreateOrganizationInviteResponse { invite }))
 }
 
 async fn accept_organization_invite(
-    State(repository): State<Arc<Mutex<InMemoryRepository>>>,
+    State(pool): State<PgPool>,
     headers: HeaderMap,
     Path(token): Path<String>,
 ) -> Result<Json<AcceptOrganizationInviteResponse>, ApiError> {
     let user_id = current_user_id(&headers)?;
-    let mut repository = repository.lock().map_err(|_| ApiError::internal())?;
-    let user = repository
-        .users_by_id
-        .get(&user_id)
-        .cloned()
-        .ok_or_else(|| ApiError::unauthorized("user does not exist"))?;
-    let invite = repository
-        .organization_invites_by_token
-        .get_mut(&token)
-        .ok_or_else(|| ApiError::not_found("organization invite does not exist"))?;
+    let user = require_user(&pool, user_id).await?;
+    let row = sqlx::query(
+        r#"
+        SELECT id, organization_id, email, role::text AS role, token_hash, invited_by,
+            accepted_at, created_at
+        FROM organization_invites
+        WHERE token_hash = $1
+        "#,
+    )
+    .bind(&token)
+    .fetch_optional(&pool)
+    .await
+    .map_err(map_sql_error)?
+    .ok_or_else(|| ApiError::not_found("organization invite does not exist"))?;
+    let invite = invite_from_row(&row);
 
     if invite.accepted_at.is_some() {
         return Err(ApiError::conflict(
             "organization invite has already been accepted",
         ));
     }
-
     if invite.email != user.email {
         return Err(ApiError::forbidden(
             "organization invite belongs to a different email address",
         ));
     }
 
-    invite.accepted_at = Some(Utc::now());
-    let invite = invite.clone();
-    let membership = OrganizationMembership {
-        organization_id: invite.organization_id,
-        user_id,
-        role: invite.role,
-        created_at: Utc::now(),
-    };
+    let mut transaction = pool.begin().await.map_err(map_sql_error)?;
+    sqlx::query("UPDATE organization_invites SET accepted_at = now() WHERE id = $1")
+        .bind(invite.id)
+        .execute(&mut *transaction)
+        .await
+        .map_err(map_sql_error)?;
+    let membership_row = sqlx::query(
+        r#"
+        INSERT INTO organization_members (organization_id, user_id, role)
+        VALUES ($1, $2, $3::member_role)
+        ON CONFLICT (organization_id, user_id)
+        DO UPDATE SET role = EXCLUDED.role
+        RETURNING organization_id, user_id, role::text AS role, created_at
+        "#,
+    )
+    .bind(invite.organization_id)
+    .bind(user_id)
+    .bind(member_role_slug(invite.role))
+    .fetch_one(&mut *transaction)
+    .await
+    .map_err(map_sql_error)?;
+    transaction.commit().await.map_err(map_sql_error)?;
 
-    if let Some(existing) = repository.memberships.iter_mut().find(|membership| {
-        membership.organization_id == invite.organization_id && membership.user_id == user_id
-    }) {
-        existing.role = invite.role;
-    } else {
-        repository.memberships.push(membership.clone());
-    }
-
-    let organization = repository
-        .organizations_by_id
-        .get(&invite.organization_id)
-        .cloned()
+    let organization = organization_by_id(&pool, invite.organization_id)
+        .await?
         .ok_or_else(ApiError::internal)?;
+
+    record_audit(
+        &pool,
+        Some(invite.organization_id),
+        Some(user_id),
+        "organization.invite_accepted",
+        "organization_invite",
+        Some(invite.id),
+        json!({}),
+    )
+    .await?;
 
     Ok(Json(AcceptOrganizationInviteResponse {
         organization,
-        membership,
+        membership: membership_from_row(&membership_row),
     }))
 }
 
 async fn update_member_role(
-    State(repository): State<Arc<Mutex<InMemoryRepository>>>,
+    State(pool): State<PgPool>,
     headers: HeaderMap,
     Path((organization_id, member_user_id)): Path<(Uuid, Uuid)>,
     Json(request): Json<UpdateMemberRoleRequest>,
 ) -> Result<Json<UpdateMemberRoleResponse>, ApiError> {
     let user_id = current_user_id(&headers)?;
-    let mut repository = repository.lock().map_err(|_| ApiError::internal())?;
-    let actor_role = repository.require_membership(user_id, organization_id)?;
-
+    let actor_role = require_membership(&pool, user_id, organization_id).await?;
     if !matches!(actor_role, MemberRole::Owner | MemberRole::Admin) {
         return Err(ApiError::forbidden(
             "only organization owners and admins can update member roles",
         ));
     }
-
     if matches!(request.role, MemberRole::Owner) && !matches!(actor_role, MemberRole::Owner) {
         return Err(ApiError::forbidden("only owners can assign owner role"));
     }
 
-    let membership = repository
-        .memberships
-        .iter_mut()
-        .find(|membership| {
-            membership.organization_id == organization_id && membership.user_id == member_user_id
-        })
-        .ok_or_else(|| ApiError::not_found("organization member does not exist"))?;
+    let row = sqlx::query(
+        r#"
+        UPDATE organization_members
+        SET role = $3::member_role
+        WHERE organization_id = $1 AND user_id = $2
+        RETURNING organization_id, user_id, role::text AS role, created_at
+        "#,
+    )
+    .bind(organization_id)
+    .bind(member_user_id)
+    .bind(member_role_slug(request.role))
+    .fetch_optional(&pool)
+    .await
+    .map_err(map_sql_error)?
+    .ok_or_else(|| ApiError::not_found("organization member does not exist"))?;
 
-    membership.role = request.role;
+    record_audit(
+        &pool,
+        Some(organization_id),
+        Some(user_id),
+        "organization.member_role_updated",
+        "user",
+        Some(member_user_id),
+        json!({ "role": member_role_slug(request.role) }),
+    )
+    .await?;
 
     Ok(Json(UpdateMemberRoleResponse {
-        membership: membership.clone(),
+        membership: membership_from_row(&row),
     }))
 }
 
 async fn create_domain_asset(
-    State(repository): State<Arc<Mutex<InMemoryRepository>>>,
+    State(pool): State<PgPool>,
     headers: HeaderMap,
     Path(organization_id): Path<Uuid>,
     Json(request): Json<CreateDomainAssetRequest>,
 ) -> Result<Json<CreateDomainAssetResponse>, ApiError> {
     let user_id = current_user_id(&headers)?;
-
     if !request.authorization_attested {
         return Err(ApiError::bad_request(
             "authorization attestation is required before adding a domain",
         ));
     }
-
-    let domain = validate_domain(&request.domain)
-        .map_err(|error| ApiError::bad_request(error.to_string()))?;
-    let mut repository = repository.lock().map_err(|_| ApiError::internal())?;
-    let role = repository.require_membership(user_id, organization_id)?;
-
+    let role = require_membership(&pool, user_id, organization_id).await?;
     if !matches!(role, MemberRole::Owner | MemberRole::Admin) {
         return Err(ApiError::forbidden(
             "only organization owners and admins can add monitored domains",
         ));
     }
+    let domain = validate_domain(&request.domain)
+        .map_err(|error| ApiError::bad_request(error.to_string()))?;
 
-    let key = (organization_id, domain.clone());
+    let row = sqlx::query(
+        r#"
+        INSERT INTO assets
+            (id, organization_id, kind, value, authorization_attested_by, authorization_attested_at)
+        VALUES ($1, $2, 'domain', $3, $4, now())
+        RETURNING id, organization_id, value, authorization_attested_by,
+            authorization_attested_at, created_at
+        "#,
+    )
+    .bind(Uuid::now_v7())
+    .bind(organization_id)
+    .bind(domain)
+    .bind(user_id)
+    .fetch_one(&pool)
+    .await
+    .map_err(map_sql_error)?;
+    let asset = domain_asset_from_row(&row);
 
-    if repository.domain_asset_ids_by_org_domain.contains_key(&key) {
-        return Err(ApiError::conflict(
-            "domain is already monitored by this organization",
-        ));
-    }
-
-    let now = Utc::now();
-    let asset = DomainAsset {
-        id: Uuid::now_v7(),
-        organization_id,
-        domain,
-        authorization_attested_by: user_id,
-        authorization_attested_at: now,
-        created_at: now,
-    };
-
-    repository
-        .domain_asset_ids_by_org_domain
-        .insert(key, asset.id);
-    repository
-        .domain_assets_by_id
-        .insert(asset.id, asset.clone());
     record_audit(
-        &mut repository,
+        &pool,
         Some(organization_id),
         Some(user_id),
         "domain.added",
         "domain_asset",
         Some(asset.id),
-        json!({ "domain": asset.domain.clone() }),
-    );
+        json!({ "domain": asset.domain }),
+    )
+    .await?;
 
     Ok(Json(CreateDomainAssetResponse { asset }))
 }
 
 async fn list_domain_assets(
-    State(repository): State<Arc<Mutex<InMemoryRepository>>>,
+    State(pool): State<PgPool>,
     headers: HeaderMap,
     Path(organization_id): Path<Uuid>,
 ) -> Result<Json<Vec<DomainAsset>>, ApiError> {
     let user_id = current_user_id(&headers)?;
-    let repository = repository.lock().map_err(|_| ApiError::internal())?;
-    repository.require_membership(user_id, organization_id)?;
+    require_membership(&pool, user_id, organization_id).await?;
+    let rows = sqlx::query(
+        r#"
+        SELECT id, organization_id, value, authorization_attested_by,
+            authorization_attested_at, created_at
+        FROM assets
+        WHERE organization_id = $1 AND kind = 'domain'
+        ORDER BY value ASC
+        "#,
+    )
+    .bind(organization_id)
+    .fetch_all(&pool)
+    .await
+    .map_err(map_sql_error)?;
 
-    let mut assets = repository
-        .domain_assets_by_id
-        .values()
-        .filter(|asset| asset.organization_id == organization_id)
-        .cloned()
-        .collect::<Vec<_>>();
-
-    assets.sort_by(|left, right| left.domain.cmp(&right.domain));
-
-    Ok(Json(assets))
+    Ok(Json(rows.iter().map(domain_asset_from_row).collect()))
 }
 
 async fn create_scan_job(
-    State(repository): State<Arc<Mutex<InMemoryRepository>>>,
+    State(pool): State<PgPool>,
     headers: HeaderMap,
     Path((organization_id, asset_id)): Path<(Uuid, Uuid)>,
     Json(request): Json<CreateScanJobRequest>,
 ) -> Result<Json<CreateScanJobResponse>, ApiError> {
     let user_id = current_user_id(&headers)?;
-    let reason = validate_scan_reason(request.reason)?;
-    let mut repository = repository.lock().map_err(|_| ApiError::internal())?;
-    let role = repository.require_membership(user_id, organization_id)?;
-
+    let role = require_membership(&pool, user_id, organization_id).await?;
     if matches!(role, MemberRole::Viewer) {
         return Err(ApiError::forbidden(
             "viewers cannot trigger external exposure scans",
         ));
     }
+    require_asset_in_org(&pool, organization_id, asset_id).await?;
+    let reason = validate_scan_reason(request.reason)?;
 
-    let asset = repository
-        .domain_assets_by_id
-        .get(&asset_id)
-        .ok_or_else(|| ApiError::not_found("domain asset does not exist"))?;
+    let row = sqlx::query(
+        r#"
+        INSERT INTO scan_jobs (id, organization_id, requested_by, asset_id, reason, scan_type)
+        VALUES ($1, $2, $3, $4, $5, 'dns_baseline')
+        RETURNING id, organization_id, asset_id, requested_by, status::text AS status, reason,
+            created_at, started_at, completed_at
+        "#,
+    )
+    .bind(Uuid::now_v7())
+    .bind(organization_id)
+    .bind(user_id)
+    .bind(asset_id)
+    .bind(reason)
+    .fetch_one(&pool)
+    .await
+    .map_err(map_sql_error)?;
+    let scan_job = scan_job_from_row(&row);
 
-    if asset.organization_id != organization_id {
-        return Err(ApiError::not_found(
-            "domain asset does not belong to this organization",
-        ));
-    }
-
-    let scan_job = ScanJob {
-        id: Uuid::now_v7(),
-        organization_id,
-        asset_id,
-        requested_by: user_id,
-        status: ScanStatus::Queued,
-        reason,
-        created_at: Utc::now(),
-        started_at: None,
-        completed_at: None,
-    };
-
-    repository
-        .scan_jobs_by_id
-        .insert(scan_job.id, scan_job.clone());
     record_audit(
-        &mut repository,
+        &pool,
         Some(organization_id),
         Some(user_id),
         "scan.queued",
         "scan_job",
         Some(scan_job.id),
-        json!({ "asset_id": asset_id, "reason": scan_job.reason.clone() }),
-    );
+        json!({ "asset_id": asset_id, "reason": scan_job.reason }),
+    )
+    .await?;
 
     Ok(Json(CreateScanJobResponse { scan_job }))
 }
 
 async fn list_scan_jobs(
-    State(repository): State<Arc<Mutex<InMemoryRepository>>>,
+    State(pool): State<PgPool>,
     headers: HeaderMap,
     Path(organization_id): Path<Uuid>,
 ) -> Result<Json<Vec<ScanJob>>, ApiError> {
     let user_id = current_user_id(&headers)?;
-    let repository = repository.lock().map_err(|_| ApiError::internal())?;
-    repository.require_membership(user_id, organization_id)?;
+    require_membership(&pool, user_id, organization_id).await?;
+    let rows = sqlx::query(
+        r#"
+        SELECT id, organization_id, asset_id, requested_by, status::text AS status, reason,
+            created_at, started_at, completed_at
+        FROM scan_jobs
+        WHERE organization_id = $1
+        ORDER BY created_at DESC
+        "#,
+    )
+    .bind(organization_id)
+    .fetch_all(&pool)
+    .await
+    .map_err(map_sql_error)?;
 
-    let mut scan_jobs = repository
-        .scan_jobs_by_id
-        .values()
-        .filter(|scan_job| scan_job.organization_id == organization_id)
-        .cloned()
-        .collect::<Vec<_>>();
-
-    scan_jobs.sort_by_key(|scan_job| Reverse(scan_job.created_at));
-
-    Ok(Json(scan_jobs))
-}
-
-fn claim_scan_job_asset(
-    repository: &Arc<Mutex<InMemoryRepository>>,
-    user_id: Uuid,
-    organization_id: Uuid,
-    scan_job_id: Uuid,
-) -> Result<(Uuid, String), ApiError> {
-    let mut repository = repository.lock().map_err(|_| ApiError::internal())?;
-    let role = repository.require_membership(user_id, organization_id)?;
-
-    if matches!(role, MemberRole::Viewer) {
-        return Err(ApiError::forbidden("viewers cannot run scan jobs"));
-    }
-
-    let scan_job_asset_id = {
-        let scan_job = repository
-            .scan_jobs_by_id
-            .get_mut(&scan_job_id)
-            .ok_or_else(|| ApiError::not_found("scan job does not exist"))?;
-
-        if scan_job.organization_id != organization_id {
-            return Err(ApiError::not_found(
-                "scan job does not belong to this organization",
-            ));
-        }
-
-        if scan_job.status != ScanStatus::Queued {
-            return Err(ApiError::conflict("only queued scan jobs can be run"));
-        }
-
-        scan_job.status = ScanStatus::Running;
-        scan_job.started_at = Some(Utc::now());
-        scan_job.asset_id
-    };
-
-    let asset = repository
-        .domain_assets_by_id
-        .get(&scan_job_asset_id)
-        .ok_or_else(|| ApiError::not_found("domain asset does not exist"))?;
-
-    Ok((asset.id, asset.domain.clone()))
-}
-
-fn complete_scan_job_with_result(
-    repository: &Arc<Mutex<InMemoryRepository>>,
-    scan_job_id: Uuid,
-    scan_result: ScanResult,
-) -> Result<ScanJob, ApiError> {
-    let mut repository = repository.lock().map_err(|_| ApiError::internal())?;
-    let completed_at = Utc::now();
-    let scan_job = repository
-        .scan_jobs_by_id
-        .get_mut(&scan_job_id)
-        .ok_or_else(|| ApiError::not_found("scan job does not exist"))?;
-    scan_job.status = ScanStatus::Completed;
-    scan_job.completed_at = Some(completed_at);
-    let scan_job = scan_job.clone();
-
-    let scan_result_id = scan_result.id;
-    let scan_result_source = scan_result.source.clone();
-    repository
-        .scan_results_by_id
-        .insert(scan_result.id, scan_result);
-    record_audit(
-        &mut repository,
-        Some(scan_job.organization_id),
-        None,
-        "scan.completed",
-        "scan_job",
-        Some(scan_job.id),
-        json!({ "scan_result_id": scan_result_id, "source": scan_result_source }),
-    );
-
-    Ok(scan_job)
+    Ok(Json(rows.iter().map(scan_job_from_row).collect()))
 }
 
 async fn run_dns_baseline_scan(
-    State(repository): State<Arc<Mutex<InMemoryRepository>>>,
+    State(pool): State<PgPool>,
     headers: HeaderMap,
     Path((organization_id, scan_job_id)): Path<(Uuid, Uuid)>,
 ) -> Result<Json<RunDnsBaselineScanResponse>, ApiError> {
+    run_scan_now(pool, headers, organization_id, scan_job_id, "dns_baseline").await
+}
+
+async fn run_http_probe_scan(
+    State(pool): State<PgPool>,
+    headers: HeaderMap,
+    Path((organization_id, scan_job_id)): Path<(Uuid, Uuid)>,
+) -> Result<Json<RunDnsBaselineScanResponse>, ApiError> {
+    run_scan_now(pool, headers, organization_id, scan_job_id, "http_probe").await
+}
+
+async fn run_dns_policy_scan(
+    State(pool): State<PgPool>,
+    headers: HeaderMap,
+    Path((organization_id, scan_job_id)): Path<(Uuid, Uuid)>,
+) -> Result<Json<RunDnsBaselineScanResponse>, ApiError> {
+    run_scan_now(pool, headers, organization_id, scan_job_id, "dns_policy").await
+}
+
+async fn run_scan_now(
+    pool: PgPool,
+    headers: HeaderMap,
+    organization_id: Uuid,
+    scan_job_id: Uuid,
+    source: &str,
+) -> Result<Json<RunDnsBaselineScanResponse>, ApiError> {
     let user_id = current_user_id(&headers)?;
-    let (asset_id, domain) = {
-        let mut repository = repository.lock().map_err(|_| ApiError::internal())?;
-        let role = repository.require_membership(user_id, organization_id)?;
-
-        if matches!(role, MemberRole::Viewer) {
-            return Err(ApiError::forbidden("viewers cannot run scan jobs"));
+    let (asset_id, domain) =
+        claim_scan_job_asset(&pool, user_id, organization_id, scan_job_id, source).await?;
+    let evidence = match source {
+        "dns_baseline" => {
+            ScanEvidence::DnsBaseline(resolve_dns_baseline(&domain).await.map_err(|error| {
+                ApiError::bad_gateway(format!("DNS baseline scan failed: {error}"))
+            })?)
         }
-
-        let scan_job_asset_id = {
-            let scan_job = repository
-                .scan_jobs_by_id
-                .get_mut(&scan_job_id)
-                .ok_or_else(|| ApiError::not_found("scan job does not exist"))?;
-
-            if scan_job.organization_id != organization_id {
-                return Err(ApiError::not_found(
-                    "scan job does not belong to this organization",
-                ));
-            }
-
-            if scan_job.status != ScanStatus::Queued {
-                return Err(ApiError::conflict("only queued scan jobs can be run"));
-            }
-
-            scan_job.status = ScanStatus::Running;
-            scan_job.started_at = Some(Utc::now());
-            scan_job.asset_id
-        };
-
-        let asset = repository
-            .domain_assets_by_id
-            .get(&scan_job_asset_id)
-            .ok_or_else(|| ApiError::not_found("domain asset does not exist"))?;
-
-        (asset.id, asset.domain.clone())
+        "http_probe" => ScanEvidence::HttpProbe(
+            probe_http_endpoint(&domain, "https")
+                .await
+                .map_err(|error| ApiError::bad_gateway(format!("HTTPS probe failed: {error}")))?,
+        ),
+        "dns_policy" => {
+            ScanEvidence::DnsPolicy(collect_dns_policy_baseline(&domain).await.map_err(
+                |error| ApiError::bad_gateway(format!("DNS policy scan failed: {error}")),
+            )?)
+        }
+        _ => return Err(ApiError::bad_request("unsupported scan type")),
+    };
+    let scan_result = ScanResult {
+        id: Uuid::now_v7(),
+        organization_id,
+        asset_id,
+        scan_job_id,
+        source: source.to_string(),
+        observed_at: Utc::now(),
+        evidence,
     };
 
-    let resolved = resolve_dns_baseline(&domain).await;
-    let mut repository = repository.lock().map_err(|_| ApiError::internal())?;
-    let completed_at = Utc::now();
-
-    match resolved {
-        Ok(evidence) => {
-            let scan_result = ScanResult {
-                id: Uuid::now_v7(),
-                organization_id,
-                asset_id,
-                scan_job_id,
-                source: "dns_baseline".to_string(),
-                observed_at: completed_at,
-                evidence: ScanEvidence::DnsBaseline(evidence),
-            };
-
-            let scan_job = repository
-                .scan_jobs_by_id
-                .get_mut(&scan_job_id)
-                .ok_or_else(|| ApiError::not_found("scan job does not exist"))?;
-            scan_job.status = ScanStatus::Completed;
-            scan_job.completed_at = Some(completed_at);
-            let scan_job = scan_job.clone();
-
-            repository
-                .scan_results_by_id
-                .insert(scan_result.id, scan_result.clone());
-
-            Ok(Json(RunDnsBaselineScanResponse {
-                scan_job,
-                scan_result,
-            }))
-        }
+    match complete_scan_job_with_result(&pool, scan_job_id, &scan_result).await {
+        Ok(scan_job) => Ok(Json(RunDnsBaselineScanResponse {
+            scan_job,
+            scan_result,
+        })),
         Err(error) => {
-            if let Some(scan_job) = repository.scan_jobs_by_id.get_mut(&scan_job_id) {
-                scan_job.status = ScanStatus::Failed;
-                scan_job.completed_at = Some(completed_at);
-            }
-
-            Err(ApiError::bad_gateway(format!(
-                "DNS baseline scan failed: {error}"
-            )))
+            mark_scan_job_failed(&pool, scan_job_id, error.message.clone()).await?;
+            Err(error)
         }
     }
 }
 
-async fn run_http_probe_scan(
-    State(repository): State<Arc<Mutex<InMemoryRepository>>>,
-    headers: HeaderMap,
-    Path((organization_id, scan_job_id)): Path<(Uuid, Uuid)>,
-) -> Result<Json<RunDnsBaselineScanResponse>, ApiError> {
-    let user_id = current_user_id(&headers)?;
-    let (asset_id, domain) =
-        claim_scan_job_asset(&repository, user_id, organization_id, scan_job_id)?;
-    let observed_at = Utc::now();
-    let evidence = probe_http_endpoint(&domain, "https")
-        .await
-        .map_err(|error| ApiError::bad_gateway(format!("HTTPS probe failed: {error}")))?;
-    let scan_result = ScanResult {
-        id: Uuid::now_v7(),
-        organization_id,
-        asset_id,
-        scan_job_id,
-        source: "http_probe".to_string(),
-        observed_at,
-        evidence: ScanEvidence::HttpProbe(evidence),
-    };
-    let scan_job = complete_scan_job_with_result(&repository, scan_job_id, scan_result.clone())?;
-
-    Ok(Json(RunDnsBaselineScanResponse {
-        scan_job,
-        scan_result,
-    }))
-}
-
-async fn run_dns_policy_scan(
-    State(repository): State<Arc<Mutex<InMemoryRepository>>>,
-    headers: HeaderMap,
-    Path((organization_id, scan_job_id)): Path<(Uuid, Uuid)>,
-) -> Result<Json<RunDnsBaselineScanResponse>, ApiError> {
-    let user_id = current_user_id(&headers)?;
-    let (asset_id, domain) =
-        claim_scan_job_asset(&repository, user_id, organization_id, scan_job_id)?;
-    let observed_at = Utc::now();
-    let evidence = collect_dns_policy_baseline(&domain)
-        .await
-        .map_err(|error| ApiError::bad_gateway(format!("DNS policy scan failed: {error}")))?;
-    let scan_result = ScanResult {
-        id: Uuid::now_v7(),
-        organization_id,
-        asset_id,
-        scan_job_id,
-        source: "dns_policy".to_string(),
-        observed_at,
-        evidence: ScanEvidence::DnsPolicy(evidence),
-    };
-    let scan_job = complete_scan_job_with_result(&repository, scan_job_id, scan_result.clone())?;
-
-    Ok(Json(RunDnsBaselineScanResponse {
-        scan_job,
-        scan_result,
-    }))
-}
-
 async fn list_scan_results(
-    State(repository): State<Arc<Mutex<InMemoryRepository>>>,
+    State(pool): State<PgPool>,
     headers: HeaderMap,
     Path(organization_id): Path<Uuid>,
 ) -> Result<Json<Vec<ScanResult>>, ApiError> {
     let user_id = current_user_id(&headers)?;
-    let repository = repository.lock().map_err(|_| ApiError::internal())?;
-    repository.require_membership(user_id, organization_id)?;
+    require_membership(&pool, user_id, organization_id).await?;
+    let rows = sqlx::query(
+        r#"
+        SELECT scan_results.id, scan_results.scan_job_id, scan_results.asset_id,
+            scan_jobs.organization_id, scan_results.source, scan_results.observed_at,
+            scan_results.evidence
+        FROM scan_results
+        INNER JOIN scan_jobs ON scan_jobs.id = scan_results.scan_job_id
+        WHERE scan_jobs.organization_id = $1
+        ORDER BY scan_results.observed_at DESC
+        "#,
+    )
+    .bind(organization_id)
+    .fetch_all(&pool)
+    .await
+    .map_err(map_sql_error)?;
 
-    let mut scan_results = repository
-        .scan_results_by_id
-        .values()
-        .filter(|scan_result| scan_result.organization_id == organization_id)
-        .cloned()
-        .collect::<Vec<_>>();
-
-    scan_results.sort_by_key(|scan_result| Reverse(scan_result.observed_at));
-
-    Ok(Json(scan_results))
+    rows.iter()
+        .map(scan_result_from_row)
+        .collect::<Result<Vec<_>, _>>()
+        .map(Json)
 }
 
 async fn derive_findings(
-    State(repository): State<Arc<Mutex<InMemoryRepository>>>,
+    State(pool): State<PgPool>,
     headers: HeaderMap,
     Path((organization_id, scan_result_id)): Path<(Uuid, Uuid)>,
 ) -> Result<Json<DeriveFindingsResponse>, ApiError> {
     let user_id = current_user_id(&headers)?;
-    let mut repository = repository.lock().map_err(|_| ApiError::internal())?;
-    repository.require_membership(user_id, organization_id)?;
+    require_membership(&pool, user_id, organization_id).await?;
+    let scan_result = scan_result_by_id(&pool, organization_id, scan_result_id).await?;
+    let findings = upsert_findings(&pool, &scan_result).await?;
 
-    let scan_result = repository
-        .scan_results_by_id
-        .get(&scan_result_id)
-        .ok_or_else(|| ApiError::not_found("scan result does not exist"))?
-        .clone();
-
-    if scan_result.organization_id != organization_id {
-        return Err(ApiError::not_found(
-            "scan result does not belong to this organization",
-        ));
-    }
-
-    let now = Utc::now();
-    let mut findings = Vec::new();
-    let mut response_indexes_by_finding_id = HashMap::new();
-
-    for draft in derive_findings_from_scan_result(&scan_result) {
-        let key = (scan_result.asset_id, draft.rule_id.clone());
-
-        let finding =
-            if let Some(finding_id) = repository.finding_ids_by_asset_rule.get(&key).copied() {
-                let finding = repository
-                    .findings_by_id
-                    .get_mut(&finding_id)
-                    .ok_or_else(ApiError::internal)?;
-                finding.last_seen_at = now;
-                finding.evidence = draft.evidence;
-
-                if finding.status == FindingStatus::Remediated {
-                    finding.status = FindingStatus::Reopened;
-                }
-
-                finding.clone()
-            } else {
-                let finding = Finding {
-                    id: Uuid::now_v7(),
-                    organization_id,
-                    asset_id: scan_result.asset_id,
-                    rule_id: draft.rule_id.clone(),
-                    title: draft.title,
-                    severity: draft.severity,
-                    status: FindingStatus::Open,
-                    confidence: draft.confidence,
-                    evidence: draft.evidence,
-                    remediation: draft.remediation,
-                    first_seen_at: now,
-                    last_seen_at: now,
-                };
-
-                repository.finding_ids_by_asset_rule.insert(key, finding.id);
-                repository
-                    .findings_by_id
-                    .insert(finding.id, finding.clone());
-                finding
-            };
-
-        if let Some(index) = response_indexes_by_finding_id.get(&finding.id).copied() {
-            findings[index] = finding;
-        } else {
-            response_indexes_by_finding_id.insert(finding.id, findings.len());
-            findings.push(finding);
-        }
-    }
+    record_audit(
+        &pool,
+        Some(organization_id),
+        Some(user_id),
+        "finding.derived",
+        "scan_result",
+        Some(scan_result_id),
+        json!({ "count": findings.len() }),
+    )
+    .await?;
 
     Ok(Json(DeriveFindingsResponse { findings }))
 }
 
 async fn list_findings(
-    State(repository): State<Arc<Mutex<InMemoryRepository>>>,
+    State(pool): State<PgPool>,
     headers: HeaderMap,
     Path(organization_id): Path<Uuid>,
 ) -> Result<Json<Vec<Finding>>, ApiError> {
     let user_id = current_user_id(&headers)?;
-    let repository = repository.lock().map_err(|_| ApiError::internal())?;
-    repository.require_membership(user_id, organization_id)?;
+    require_membership(&pool, user_id, organization_id).await?;
+    let rows = sqlx::query(
+        r#"
+        SELECT id, organization_id, asset_id, rule_id, title, severity::text AS severity,
+            confidence::text AS confidence, status::text AS status, evidence, remediation,
+            first_seen_at, last_seen_at
+        FROM findings
+        WHERE organization_id = $1
+        ORDER BY last_seen_at DESC
+        "#,
+    )
+    .bind(organization_id)
+    .fetch_all(&pool)
+    .await
+    .map_err(map_sql_error)?;
 
-    let mut findings = repository
-        .findings_by_id
-        .values()
-        .filter(|finding| finding.organization_id == organization_id)
-        .cloned()
-        .collect::<Vec<_>>();
-
-    findings.sort_by_key(|finding| Reverse(finding.last_seen_at));
-
-    Ok(Json(findings))
+    Ok(Json(rows.iter().map(finding_from_row).collect()))
 }
 
 async fn update_finding_status(
-    State(repository): State<Arc<Mutex<InMemoryRepository>>>,
+    State(pool): State<PgPool>,
     headers: HeaderMap,
     Path((organization_id, finding_id)): Path<(Uuid, Uuid)>,
     Json(request): Json<UpdateFindingStatusRequest>,
 ) -> Result<Json<UpdateFindingStatusResponse>, ApiError> {
     let user_id = current_user_id(&headers)?;
+    require_membership(&pool, user_id, organization_id).await?;
     let note = validate_optional_text(request.note, "note", 1_000)?;
-    let mut repository = repository.lock().map_err(|_| ApiError::internal())?;
-    repository.require_membership(user_id, organization_id)?;
 
-    let finding = {
-        let finding = repository
-            .findings_by_id
-            .get_mut(&finding_id)
-            .ok_or_else(|| ApiError::not_found("finding does not exist"))?;
-
-        if finding.organization_id != organization_id {
-            return Err(ApiError::not_found(
-                "finding does not belong to this organization",
-            ));
-        }
-
-        finding.status = request.status;
-        finding.clone()
+    let row = sqlx::query(
+        r#"
+        UPDATE findings
+        SET status = $3::finding_status,
+            resolved_at = CASE
+                WHEN $3 IN ('remediated', 'accepted_risk', 'false_positive') THEN now()
+                ELSE NULL
+            END
+        WHERE id = $1 AND organization_id = $2
+        RETURNING id, organization_id, asset_id, rule_id, title, severity::text AS severity,
+            confidence::text AS confidence, status::text AS status, evidence, remediation,
+            first_seen_at, last_seen_at
+        "#,
+    )
+    .bind(finding_id)
+    .bind(organization_id)
+    .bind(finding_status_slug(request.status))
+    .fetch_optional(&pool)
+    .await
+    .map_err(map_sql_error)?
+    .ok_or_else(|| ApiError::not_found("finding does not exist"))?;
+    let finding = finding_from_row(&row);
+    let event = if note.is_some() {
+        Some(
+            insert_finding_event(
+                &pool,
+                organization_id,
+                finding_id,
+                user_id,
+                "status_changed",
+                note,
+            )
+            .await?,
+        )
+    } else {
+        None
     };
 
-    let event = note.map(|note| {
-        let event = FindingEvent {
-            id: Uuid::now_v7(),
-            organization_id,
-            finding_id,
-            actor_user_id: user_id,
-            event_type: format!("status_changed_to_{}", finding_status_slug(request.status)),
-            note: Some(note),
-            created_at: Utc::now(),
-        };
-        repository
-            .finding_events_by_id
-            .insert(event.id, event.clone());
-        event
-    });
     record_audit(
-        &mut repository,
+        &pool,
         Some(organization_id),
         Some(user_id),
         "finding.status_changed",
         "finding",
         Some(finding_id),
-        json!({ "status": finding_status_slug(request.status), "event_id": event.as_ref().map(|event| event.id) }),
-    );
+        json!({ "status": finding_status_slug(request.status) }),
+    )
+    .await?;
 
     Ok(Json(UpdateFindingStatusResponse { finding, event }))
 }
 
 async fn create_finding_note(
-    State(repository): State<Arc<Mutex<InMemoryRepository>>>,
+    State(pool): State<PgPool>,
     headers: HeaderMap,
     Path((organization_id, finding_id)): Path<(Uuid, Uuid)>,
     Json(request): Json<CreateFindingNoteRequest>,
 ) -> Result<Json<CreateFindingNoteResponse>, ApiError> {
     let user_id = current_user_id(&headers)?;
+    require_membership(&pool, user_id, organization_id).await?;
+    require_finding_in_org(&pool, organization_id, finding_id).await?;
     let note = validate_required_note(&request.note)?;
-    let mut repository = repository.lock().map_err(|_| ApiError::internal())?;
-    repository.require_membership(user_id, organization_id)?;
-
-    let finding = repository
-        .findings_by_id
-        .get(&finding_id)
-        .ok_or_else(|| ApiError::not_found("finding does not exist"))?;
-
-    if finding.organization_id != organization_id {
-        return Err(ApiError::not_found(
-            "finding does not belong to this organization",
-        ));
-    }
-
-    let event = FindingEvent {
-        id: Uuid::now_v7(),
+    let event = insert_finding_event(
+        &pool,
         organization_id,
         finding_id,
-        actor_user_id: user_id,
-        event_type: "note_added".to_string(),
-        note: Some(note),
-        created_at: Utc::now(),
-    };
+        user_id,
+        "note_added",
+        Some(note),
+    )
+    .await?;
 
-    repository
-        .finding_events_by_id
-        .insert(event.id, event.clone());
     record_audit(
-        &mut repository,
+        &pool,
         Some(organization_id),
         Some(user_id),
         "finding.note_added",
         "finding",
         Some(finding_id),
-        json!({ "event_id": event.id }),
-    );
+        json!({}),
+    )
+    .await?;
 
     Ok(Json(CreateFindingNoteResponse { event }))
 }
 
 async fn list_finding_notes(
-    State(repository): State<Arc<Mutex<InMemoryRepository>>>,
+    State(pool): State<PgPool>,
     headers: HeaderMap,
     Path((organization_id, finding_id)): Path<(Uuid, Uuid)>,
 ) -> Result<Json<Vec<FindingEvent>>, ApiError> {
     let user_id = current_user_id(&headers)?;
-    let repository = repository.lock().map_err(|_| ApiError::internal())?;
-    repository.require_membership(user_id, organization_id)?;
+    require_membership(&pool, user_id, organization_id).await?;
+    require_finding_in_org(&pool, organization_id, finding_id).await?;
+    let rows = sqlx::query(
+        r#"
+        SELECT id, organization_id, finding_id, actor_user_id, event_type, note, created_at
+        FROM finding_events
+        WHERE organization_id = $1 AND finding_id = $2
+        ORDER BY created_at DESC
+        "#,
+    )
+    .bind(organization_id)
+    .bind(finding_id)
+    .fetch_all(&pool)
+    .await
+    .map_err(map_sql_error)?;
 
-    let finding = repository
-        .findings_by_id
-        .get(&finding_id)
-        .ok_or_else(|| ApiError::not_found("finding does not exist"))?;
-
-    if finding.organization_id != organization_id {
-        return Err(ApiError::not_found(
-            "finding does not belong to this organization",
-        ));
-    }
-
-    let mut events = repository
-        .finding_events_by_id
-        .values()
-        .filter(|event| event.organization_id == organization_id && event.finding_id == finding_id)
-        .cloned()
-        .collect::<Vec<_>>();
-
-    events.sort_by_key(|event| Reverse(event.created_at));
-
-    Ok(Json(events))
+    Ok(Json(rows.iter().map(finding_event_from_row).collect()))
 }
 
 async fn create_slack_channel(
-    State(repository): State<Arc<Mutex<InMemoryRepository>>>,
+    State(pool): State<PgPool>,
     headers: HeaderMap,
     Path(organization_id): Path<Uuid>,
     Json(request): Json<CreateSlackChannelRequest>,
 ) -> Result<Json<CreateSlackChannelResponse>, ApiError> {
     let user_id = current_user_id(&headers)?;
-    let name = validate_channel_name(&request.name)?;
-    let webhook_url = validate_slack_webhook_url(&request.webhook_url)?;
-    let mut repository = repository.lock().map_err(|_| ApiError::internal())?;
-    let role = repository.require_membership(user_id, organization_id)?;
-
+    let role = require_membership(&pool, user_id, organization_id).await?;
     if !matches!(role, MemberRole::Owner | MemberRole::Admin) {
         return Err(ApiError::forbidden(
-            "only organization owners and admins can configure Slack channels",
+            "only organization owners and admins can configure Slack",
         ));
     }
+    let name = validate_channel_name(&request.name)?;
+    let webhook_url = validate_slack_webhook_url(&request.webhook_url)?;
+    let row = sqlx::query(
+        r#"
+        INSERT INTO notification_channels (id, organization_id, kind, name, secret_ref, enabled)
+        VALUES ($1, $2, 'slack', $3, $4, true)
+        RETURNING id, organization_id, name, enabled, created_at
+        "#,
+    )
+    .bind(Uuid::now_v7())
+    .bind(organization_id)
+    .bind(name)
+    .bind(webhook_url)
+    .fetch_one(&pool)
+    .await
+    .map_err(map_sql_error)?;
+    let channel = slack_channel_from_row(&row);
 
-    let channel = SlackNotificationChannel {
-        id: Uuid::now_v7(),
-        organization_id,
-        name,
-        enabled: true,
-        created_at: Utc::now(),
-    };
-
-    repository
-        .slack_secret_refs_by_id
-        .insert(channel.id, webhook_url);
-    repository
-        .slack_channels_by_id
-        .insert(channel.id, channel.clone());
+    record_audit(
+        &pool,
+        Some(organization_id),
+        Some(user_id),
+        "slack.channel_created",
+        "notification_channel",
+        Some(channel.id),
+        json!({ "name": channel.name }),
+    )
+    .await?;
 
     Ok(Json(CreateSlackChannelResponse { channel }))
 }
 
 async fn queue_slack_alert(
-    State(repository): State<Arc<Mutex<InMemoryRepository>>>,
+    State(pool): State<PgPool>,
     headers: HeaderMap,
     Path((organization_id, finding_id)): Path<(Uuid, Uuid)>,
 ) -> Result<Json<QueueSlackAlertResponse>, ApiError> {
     let user_id = current_user_id(&headers)?;
-    let mut repository = repository.lock().map_err(|_| ApiError::internal())?;
-    repository.require_membership(user_id, organization_id)?;
-
-    let finding = repository
-        .findings_by_id
-        .get(&finding_id)
-        .ok_or_else(|| ApiError::not_found("finding does not exist"))?
-        .clone();
-
-    if finding.organization_id != organization_id {
-        return Err(ApiError::not_found(
-            "finding does not belong to this organization",
-        ));
-    }
-
-    let channel = repository
-        .slack_channels_by_id
-        .values()
-        .find(|channel| channel.organization_id == organization_id && channel.enabled)
-        .cloned()
-        .ok_or_else(|| ApiError::conflict("no enabled Slack channel is configured"))?;
-
-    if repository.alerts_by_id.values().any(|alert| {
-        alert.organization_id == organization_id
-            && alert.finding_id == finding_id
-            && matches!(alert.status, AlertStatus::Queued | AlertStatus::Sent)
-    }) {
-        let alert = Alert {
-            id: Uuid::now_v7(),
+    require_membership(&pool, user_id, organization_id).await?;
+    let finding = require_finding_in_org(&pool, organization_id, finding_id).await?;
+    if let Some(alert) = active_alert_for_finding(&pool, finding_id).await? {
+        let suppressed = insert_alert(
+            &pool,
             organization_id,
             finding_id,
-            notification_channel_id: channel.id,
-            status: AlertStatus::Suppressed,
-            payload: "duplicate alert suppressed by noise budget".to_string(),
-            created_at: Utc::now(),
-            sent_at: None,
-        };
-        repository.alerts_by_id.insert(alert.id, alert.clone());
+            alert.notification_channel_id,
+            AlertStatus::Suppressed,
+            alert.payload.clone(),
+        )
+        .await?;
         record_audit(
-            &mut repository,
+            &pool,
             Some(organization_id),
             Some(user_id),
             "alert.suppressed",
             "finding",
             Some(finding_id),
             json!({ "reason": "duplicate_active_alert" }),
-        );
-
-        return Ok(Json(QueueSlackAlertResponse { alert }));
+        )
+        .await?;
+        return Ok(Json(QueueSlackAlertResponse { alert: suppressed }));
     }
 
-    let asset_domain = repository
-        .domain_assets_by_id
-        .get(&finding.asset_id)
-        .map(|asset| asset.domain.as_str())
-        .unwrap_or("unknown-domain");
-    let payload = build_slack_finding_alert(&finding, asset_domain).text;
-
-    let alert = Alert {
-        id: Uuid::now_v7(),
+    let channel = first_enabled_slack_channel(&pool, organization_id)
+        .await?
+        .ok_or_else(|| ApiError::conflict("no enabled Slack notification channel exists"))?;
+    let domain = domain_for_asset(&pool, finding.asset_id)
+        .await?
+        .unwrap_or_else(|| "unknown-domain".to_string());
+    let payload = build_slack_finding_alert(&finding, &domain).text;
+    let alert = insert_alert(
+        &pool,
         organization_id,
         finding_id,
-        notification_channel_id: channel.id,
-        status: AlertStatus::Queued,
+        channel.id,
+        AlertStatus::Queued,
         payload,
-        created_at: Utc::now(),
-        sent_at: None,
-    };
+    )
+    .await?;
 
-    repository.alerts_by_id.insert(alert.id, alert.clone());
     record_audit(
-        &mut repository,
+        &pool,
         Some(organization_id),
         Some(user_id),
         "alert.queued",
         "finding",
         Some(finding_id),
         json!({ "channel_id": channel.id }),
-    );
+    )
+    .await?;
 
     Ok(Json(QueueSlackAlertResponse { alert }))
 }
 
 async fn list_alerts(
-    State(repository): State<Arc<Mutex<InMemoryRepository>>>,
+    State(pool): State<PgPool>,
     headers: HeaderMap,
     Path(organization_id): Path<Uuid>,
 ) -> Result<Json<Vec<Alert>>, ApiError> {
     let user_id = current_user_id(&headers)?;
-    let repository = repository.lock().map_err(|_| ApiError::internal())?;
-    repository.require_membership(user_id, organization_id)?;
+    require_membership(&pool, user_id, organization_id).await?;
+    let rows = sqlx::query(
+        r#"
+        SELECT id, organization_id, finding_id, notification_channel_id, status::text AS status,
+            payload, created_at, sent_at
+        FROM alerts
+        WHERE organization_id = $1
+        ORDER BY created_at DESC
+        "#,
+    )
+    .bind(organization_id)
+    .fetch_all(&pool)
+    .await
+    .map_err(map_sql_error)?;
 
-    let mut alerts = repository
-        .alerts_by_id
-        .values()
-        .filter(|alert| alert.organization_id == organization_id)
-        .cloned()
-        .collect::<Vec<_>>();
-
-    alerts.sort_by_key(|alert| Reverse(alert.created_at));
-
-    Ok(Json(alerts))
+    Ok(Json(rows.iter().map(alert_from_row).collect()))
 }
 
 async fn deliver_alert(
-    State(repository): State<Arc<Mutex<InMemoryRepository>>>,
+    State(pool): State<PgPool>,
     headers: HeaderMap,
     Path((organization_id, alert_id)): Path<(Uuid, Uuid)>,
 ) -> Result<Json<QueueSlackAlertResponse>, ApiError> {
     let user_id = current_user_id(&headers)?;
-    let (webhook_url, message, alert) = {
-        let mut repository = repository.lock().map_err(|_| ApiError::internal())?;
-        repository.require_membership(user_id, organization_id)?;
-        let alert = repository
-            .alerts_by_id
-            .get(&alert_id)
-            .ok_or_else(|| ApiError::not_found("alert does not exist"))?
-            .clone();
-
-        if alert.organization_id != organization_id {
-            return Err(ApiError::not_found(
-                "alert does not belong to this organization",
-            ));
-        }
-
-        if alert.status != AlertStatus::Queued {
-            return Err(ApiError::conflict("only queued alerts can be delivered"));
-        }
-
-        let webhook_url = repository
-            .slack_secret_refs_by_id
-            .get(&alert.notification_channel_id)
-            .cloned()
-            .ok_or_else(|| ApiError::conflict("alert channel has no webhook secret"))?;
-        let message = ceem_alerts::SlackMessage {
-            text: alert.payload.clone(),
-        };
-        record_audit(
-            &mut repository,
-            Some(organization_id),
-            Some(user_id),
-            "alert.delivery_started",
-            "alert",
-            Some(alert_id),
-            json!({}),
-        );
-
-        (webhook_url, message, alert)
-    };
-
-    let delivered = deliver_slack_message(&webhook_url, &message).await;
-    let mut repository = repository.lock().map_err(|_| ApiError::internal())?;
-    let alert = repository
-        .alerts_by_id
-        .get_mut(&alert.id)
-        .ok_or_else(|| ApiError::not_found("alert does not exist"))?;
-
-    match delivered {
-        Ok(result) => {
-            alert.status = AlertStatus::Sent;
-            alert.sent_at = Some(Utc::now());
-            let alert = alert.clone();
-            record_audit(
-                &mut repository,
-                Some(organization_id),
-                Some(user_id),
-                "alert.sent",
-                "alert",
-                Some(alert_id),
-                json!({ "status_code": result.status_code }),
-            );
-
-            Ok(Json(QueueSlackAlertResponse { alert }))
-        }
-        Err(error) => {
-            alert.status = AlertStatus::Failed;
-            let alert = alert.clone();
-            record_audit(
-                &mut repository,
-                Some(organization_id),
-                Some(user_id),
-                "alert.failed",
-                "alert",
-                Some(alert_id),
-                json!({ "error": error.to_string() }),
-            );
-
-            Ok(Json(QueueSlackAlertResponse { alert }))
-        }
+    require_membership(&pool, user_id, organization_id).await?;
+    let row = sqlx::query(
+        r#"
+        SELECT alerts.id, alerts.organization_id, alerts.finding_id, alerts.notification_channel_id,
+            alerts.status::text AS status, alerts.payload, alerts.created_at, alerts.sent_at,
+            notification_channels.secret_ref
+        FROM alerts
+        INNER JOIN notification_channels ON notification_channels.id = alerts.notification_channel_id
+        WHERE alerts.id = $1 AND alerts.organization_id = $2
+        "#,
+    )
+    .bind(alert_id)
+    .bind(organization_id)
+    .fetch_optional(&pool)
+    .await
+    .map_err(map_sql_error)?
+    .ok_or_else(|| ApiError::not_found("alert does not exist"))?;
+    let alert = alert_from_row(&row);
+    if alert.status != AlertStatus::Queued {
+        return Err(ApiError::conflict("only queued alerts can be delivered"));
     }
+
+    record_audit(
+        &pool,
+        Some(organization_id),
+        Some(user_id),
+        "alert.delivery_started",
+        "alert",
+        Some(alert_id),
+        json!({}),
+    )
+    .await?;
+
+    let webhook_url: String = row.get("secret_ref");
+    let delivered = deliver_slack_message(
+        &webhook_url,
+        &ceem_alerts::SlackMessage {
+            text: alert.payload.clone(),
+        },
+    )
+    .await;
+    let (status, sent_at, metadata) = match delivered {
+        Ok(result) => (
+            AlertStatus::Sent,
+            Some(Utc::now()),
+            json!({ "status_code": result.status_code }),
+        ),
+        Err(error) => (
+            AlertStatus::Failed,
+            None,
+            json!({ "error": error.to_string() }),
+        ),
+    };
+    let updated = update_alert_delivery(&pool, alert_id, status, sent_at).await?;
+    record_audit(
+        &pool,
+        Some(organization_id),
+        Some(user_id),
+        if status == AlertStatus::Sent {
+            "alert.sent"
+        } else {
+            "alert.failed"
+        },
+        "alert",
+        Some(alert_id),
+        metadata,
+    )
+    .await?;
+
+    Ok(Json(QueueSlackAlertResponse { alert: updated }))
 }
 
 async fn create_remediation_task(
-    State(repository): State<Arc<Mutex<InMemoryRepository>>>,
+    State(pool): State<PgPool>,
     headers: HeaderMap,
     Path((organization_id, finding_id)): Path<(Uuid, Uuid)>,
     Json(request): Json<CreateRemediationTaskRequest>,
 ) -> Result<Json<CreateRemediationTaskResponse>, ApiError> {
     let user_id = current_user_id(&headers)?;
-    let mut repository = repository.lock().map_err(|_| ApiError::internal())?;
-    repository.require_membership(user_id, organization_id)?;
-
-    let finding = repository
-        .findings_by_id
-        .get(&finding_id)
-        .ok_or_else(|| ApiError::not_found("finding does not exist"))?
-        .clone();
-
-    if finding.organization_id != organization_id {
-        return Err(ApiError::not_found(
-            "finding does not belong to this organization",
-        ));
-    }
-
+    require_membership(&pool, user_id, organization_id).await?;
+    let finding = require_finding_in_org(&pool, organization_id, finding_id).await?;
     let title = validate_task_title(
         request
             .title
             .unwrap_or_else(|| format!("Remediate: {}", finding.title)),
     )?;
     let assignee = validate_optional_text(request.assignee, "assignee", 120)?;
-    let now = Utc::now();
-    let task = RemediationTask {
-        id: Uuid::now_v7(),
-        organization_id,
-        finding_id,
-        title,
-        status: RemediationStatus::Open,
-        assignee,
-        created_at: now,
-        updated_at: now,
-    };
+    let row = sqlx::query(
+        r#"
+        INSERT INTO remediation_tasks (id, organization_id, finding_id, title, status, assignee)
+        VALUES ($1, $2, $3, $4, 'open', $5)
+        RETURNING id, organization_id, finding_id, title, status, assignee, created_at, updated_at
+        "#,
+    )
+    .bind(Uuid::now_v7())
+    .bind(organization_id)
+    .bind(finding_id)
+    .bind(title)
+    .bind(assignee)
+    .fetch_one(&pool)
+    .await
+    .map_err(map_sql_error)?;
+    let task = remediation_task_from_row(&row);
 
-    repository
-        .remediation_tasks_by_id
-        .insert(task.id, task.clone());
     record_audit(
-        &mut repository,
+        &pool,
         Some(organization_id),
         Some(user_id),
         "remediation.created",
         "remediation_task",
         Some(task.id),
         json!({ "finding_id": finding_id }),
-    );
+    )
+    .await?;
 
     Ok(Json(CreateRemediationTaskResponse { task }))
 }
 
 async fn list_remediation_tasks(
-    State(repository): State<Arc<Mutex<InMemoryRepository>>>,
+    State(pool): State<PgPool>,
     headers: HeaderMap,
     Path(organization_id): Path<Uuid>,
 ) -> Result<Json<Vec<RemediationTask>>, ApiError> {
     let user_id = current_user_id(&headers)?;
-    let repository = repository.lock().map_err(|_| ApiError::internal())?;
-    repository.require_membership(user_id, organization_id)?;
+    require_membership(&pool, user_id, organization_id).await?;
+    let rows = sqlx::query(
+        r#"
+        SELECT id, organization_id, finding_id, title, status, assignee, created_at, updated_at
+        FROM remediation_tasks
+        WHERE organization_id = $1
+        ORDER BY updated_at DESC
+        "#,
+    )
+    .bind(organization_id)
+    .fetch_all(&pool)
+    .await
+    .map_err(map_sql_error)?;
 
-    let mut tasks = repository
-        .remediation_tasks_by_id
-        .values()
-        .filter(|task| task.organization_id == organization_id)
-        .cloned()
-        .collect::<Vec<_>>();
-
-    tasks.sort_by_key(|task| Reverse(task.updated_at));
-
-    Ok(Json(tasks))
+    Ok(Json(rows.iter().map(remediation_task_from_row).collect()))
 }
 
 async fn update_remediation_status(
-    State(repository): State<Arc<Mutex<InMemoryRepository>>>,
+    State(pool): State<PgPool>,
     headers: HeaderMap,
     Path((organization_id, task_id)): Path<(Uuid, Uuid)>,
     Json(request): Json<UpdateRemediationStatusRequest>,
 ) -> Result<Json<UpdateRemediationStatusResponse>, ApiError> {
     let user_id = current_user_id(&headers)?;
-    let mut repository = repository.lock().map_err(|_| ApiError::internal())?;
-    repository.require_membership(user_id, organization_id)?;
-
-    let (finding_id, task) = {
-        let task = repository
-            .remediation_tasks_by_id
-            .get_mut(&task_id)
-            .ok_or_else(|| ApiError::not_found("remediation task does not exist"))?;
-
-        if task.organization_id != organization_id {
-            return Err(ApiError::not_found(
-                "remediation task does not belong to this organization",
-            ));
-        }
-
-        task.status = request.status;
-        task.updated_at = Utc::now();
-        (task.finding_id, task.clone())
+    require_membership(&pool, user_id, organization_id).await?;
+    let row = sqlx::query(
+        r#"
+        UPDATE remediation_tasks
+        SET status = $3, updated_at = now()
+        WHERE id = $1 AND organization_id = $2
+        RETURNING id, organization_id, finding_id, title, status, assignee, created_at, updated_at
+        "#,
+    )
+    .bind(task_id)
+    .bind(organization_id)
+    .bind(remediation_status_slug(request.status))
+    .fetch_optional(&pool)
+    .await
+    .map_err(map_sql_error)?
+    .ok_or_else(|| ApiError::not_found("remediation task does not exist"))?;
+    let task = remediation_task_from_row(&row);
+    let finding_status = match request.status {
+        RemediationStatus::Open => FindingStatus::Open,
+        RemediationStatus::InProgress | RemediationStatus::Blocked => FindingStatus::InProgress,
+        RemediationStatus::Remediated => FindingStatus::Remediated,
+        RemediationStatus::AcceptedRisk => FindingStatus::AcceptedRisk,
+        RemediationStatus::FalsePositive => FindingStatus::FalsePositive,
     };
-
-    if let Some(finding) = repository.findings_by_id.get_mut(&finding_id) {
-        finding.status = match request.status {
-            RemediationStatus::Open => FindingStatus::Open,
-            RemediationStatus::InProgress | RemediationStatus::Blocked => FindingStatus::InProgress,
-            RemediationStatus::Remediated => FindingStatus::Remediated,
-            RemediationStatus::AcceptedRisk => FindingStatus::AcceptedRisk,
-            RemediationStatus::FalsePositive => FindingStatus::FalsePositive,
-        };
-    }
+    sqlx::query("UPDATE findings SET status = $2::finding_status WHERE id = $1")
+        .bind(task.finding_id)
+        .bind(finding_status_slug(finding_status))
+        .execute(&pool)
+        .await
+        .map_err(map_sql_error)?;
     record_audit(
-        &mut repository,
+        &pool,
         Some(organization_id),
         Some(user_id),
         "remediation.status_changed",
         "remediation_task",
         Some(task_id),
-        json!({ "status": remediation_status_slug(request.status), "finding_id": finding_id }),
-    );
+        json!({ "status": remediation_status_slug(request.status), "finding_id": task.finding_id }),
+    )
+    .await?;
 
     Ok(Json(UpdateRemediationStatusResponse { task }))
 }
 
 async fn list_audit_logs(
-    State(repository): State<Arc<Mutex<InMemoryRepository>>>,
+    State(pool): State<PgPool>,
     headers: HeaderMap,
     Path(organization_id): Path<Uuid>,
 ) -> Result<Json<Vec<AuditLog>>, ApiError> {
     let user_id = current_user_id(&headers)?;
-    let repository = repository.lock().map_err(|_| ApiError::internal())?;
-    repository.require_membership(user_id, organization_id)?;
+    require_membership(&pool, user_id, organization_id).await?;
+    let rows = sqlx::query(
+        r#"
+        SELECT id, organization_id, actor_user_id, action, target_type, target_id, metadata, created_at
+        FROM audit_logs
+        WHERE organization_id = $1
+        ORDER BY created_at DESC
+        "#,
+    )
+    .bind(organization_id)
+    .fetch_all(&pool)
+    .await
+    .map_err(map_sql_error)?;
 
-    let mut logs = repository
-        .audit_logs_by_id
-        .values()
-        .filter(|log| log.organization_id == Some(organization_id))
-        .cloned()
-        .collect::<Vec<_>>();
+    Ok(Json(rows.iter().map(audit_log_from_row).collect()))
+}
 
-    logs.sort_by_key(|log| Reverse(log.created_at));
+async fn claim_scan_job_asset(
+    pool: &PgPool,
+    user_id: Uuid,
+    organization_id: Uuid,
+    scan_job_id: Uuid,
+    scan_type: &str,
+) -> Result<(Uuid, String), ApiError> {
+    let role = require_membership(pool, user_id, organization_id).await?;
+    if matches!(role, MemberRole::Viewer) {
+        return Err(ApiError::forbidden("viewers cannot run scan jobs"));
+    }
 
-    Ok(Json(logs))
+    let row = sqlx::query(
+        r#"
+        UPDATE scan_jobs
+        SET status = 'running',
+            started_at = COALESCE(started_at, now()),
+            locked_at = now(),
+            scan_type = $4
+        FROM assets
+        WHERE scan_jobs.id = $1
+          AND scan_jobs.organization_id = $2
+          AND scan_jobs.asset_id = assets.id
+          AND scan_jobs.status = 'queued'
+        RETURNING scan_jobs.asset_id, assets.value AS domain
+        "#,
+    )
+    .bind(scan_job_id)
+    .bind(organization_id)
+    .bind(user_id)
+    .bind(scan_type)
+    .fetch_optional(pool)
+    .await
+    .map_err(map_sql_error)?
+    .ok_or_else(|| ApiError::conflict("scan job is not queued or does not exist"))?;
+
+    Ok((row.get("asset_id"), row.get("domain")))
+}
+
+async fn complete_scan_job_with_result(
+    pool: &PgPool,
+    scan_job_id: Uuid,
+    scan_result: &ScanResult,
+) -> Result<ScanJob, ApiError> {
+    let mut transaction = pool.begin().await.map_err(map_sql_error)?;
+    sqlx::query(
+        r#"
+        INSERT INTO scan_results (id, scan_job_id, asset_id, source, observed_at, evidence)
+        VALUES ($1, $2, $3, $4, $5, $6)
+        "#,
+    )
+    .bind(scan_result.id)
+    .bind(scan_result.scan_job_id)
+    .bind(scan_result.asset_id)
+    .bind(&scan_result.source)
+    .bind(scan_result.observed_at)
+    .bind(serde_json::to_value(&scan_result.evidence).map_err(|_| ApiError::internal())?)
+    .execute(&mut *transaction)
+    .await
+    .map_err(map_sql_error)?;
+    let row = sqlx::query(
+        r#"
+        UPDATE scan_jobs
+        SET status = 'completed', completed_at = now(), locked_at = NULL
+        WHERE id = $1
+        RETURNING id, organization_id, asset_id, requested_by, status::text AS status, reason,
+            created_at, started_at, completed_at
+        "#,
+    )
+    .bind(scan_job_id)
+    .fetch_one(&mut *transaction)
+    .await
+    .map_err(map_sql_error)?;
+    transaction.commit().await.map_err(map_sql_error)?;
+    let scan_job = scan_job_from_row(&row);
+    record_audit(
+        pool,
+        Some(scan_job.organization_id),
+        None,
+        "scan.completed",
+        "scan_job",
+        Some(scan_job.id),
+        json!({ "scan_result_id": scan_result.id, "source": scan_result.source }),
+    )
+    .await?;
+    Ok(scan_job)
+}
+
+async fn mark_scan_job_failed(
+    pool: &PgPool,
+    scan_job_id: Uuid,
+    error_message: String,
+) -> Result<(), ApiError> {
+    sqlx::query(
+        "UPDATE scan_jobs SET status = 'failed', completed_at = now(), locked_at = NULL, error_message = $2 WHERE id = $1",
+    )
+    .bind(scan_job_id)
+    .bind(error_message)
+    .execute(pool)
+    .await
+    .map_err(map_sql_error)?;
+    Ok(())
+}
+
+async fn upsert_findings(
+    pool: &PgPool,
+    scan_result: &ScanResult,
+) -> Result<Vec<Finding>, ApiError> {
+    let mut findings = Vec::new();
+    for draft in derive_findings_from_scan_result(scan_result) {
+        let row = sqlx::query(
+            r#"
+            INSERT INTO findings (
+                id, organization_id, asset_id, rule_id, title, severity, confidence,
+                status, evidence, remediation, first_seen_at, last_seen_at
+            )
+            VALUES ($1, $2, $3, $4, $5, $6::severity, $7::confidence, 'open',
+                $8, $9, now(), now())
+            ON CONFLICT (asset_id, rule_id)
+            DO UPDATE SET
+                title = EXCLUDED.title,
+                severity = EXCLUDED.severity,
+                confidence = EXCLUDED.confidence,
+                evidence = EXCLUDED.evidence,
+                remediation = EXCLUDED.remediation,
+                last_seen_at = now(),
+                status = CASE
+                    WHEN findings.status = 'remediated' THEN 'reopened'::finding_status
+                    ELSE findings.status
+                END
+            RETURNING id, organization_id, asset_id, rule_id, title, severity::text AS severity,
+                confidence::text AS confidence, status::text AS status, evidence, remediation,
+                first_seen_at, last_seen_at
+            "#,
+        )
+        .bind(Uuid::now_v7())
+        .bind(scan_result.organization_id)
+        .bind(scan_result.asset_id)
+        .bind(&draft.rule_id)
+        .bind(&draft.title)
+        .bind(severity_slug(draft.severity))
+        .bind(confidence_slug(draft.confidence))
+        .bind(&draft.evidence)
+        .bind(&draft.remediation)
+        .fetch_one(pool)
+        .await
+        .map_err(map_sql_error)?;
+        findings.push(finding_from_row(&row));
+    }
+    Ok(findings)
+}
+
+async fn insert_finding_event(
+    pool: &PgPool,
+    organization_id: Uuid,
+    finding_id: Uuid,
+    actor_user_id: Uuid,
+    event_type: &str,
+    note: Option<String>,
+) -> Result<FindingEvent, ApiError> {
+    let row = sqlx::query(
+        r#"
+        INSERT INTO finding_events (id, organization_id, finding_id, actor_user_id, event_type, note)
+        VALUES ($1, $2, $3, $4, $5, $6)
+        RETURNING id, organization_id, finding_id, actor_user_id, event_type, note, created_at
+        "#,
+    )
+    .bind(Uuid::now_v7())
+    .bind(organization_id)
+    .bind(finding_id)
+    .bind(actor_user_id)
+    .bind(event_type)
+    .bind(note)
+    .fetch_one(pool)
+    .await
+    .map_err(map_sql_error)?;
+
+    Ok(finding_event_from_row(&row))
+}
+
+async fn insert_alert(
+    pool: &PgPool,
+    organization_id: Uuid,
+    finding_id: Uuid,
+    channel_id: Uuid,
+    status: AlertStatus,
+    payload: String,
+) -> Result<Alert, ApiError> {
+    let row = sqlx::query(
+        r#"
+        INSERT INTO alerts (id, organization_id, finding_id, notification_channel_id, status, payload)
+        VALUES ($1, $2, $3, $4, $5::alert_status, $6)
+        RETURNING id, organization_id, finding_id, notification_channel_id, status::text AS status,
+            payload, created_at, sent_at
+        "#,
+    )
+    .bind(Uuid::now_v7())
+    .bind(organization_id)
+    .bind(finding_id)
+    .bind(channel_id)
+    .bind(alert_status_slug(status))
+    .bind(json!({ "text": payload }))
+    .fetch_one(pool)
+    .await
+    .map_err(map_sql_error)?;
+    Ok(alert_from_row(&row))
+}
+
+async fn update_alert_delivery(
+    pool: &PgPool,
+    alert_id: Uuid,
+    status: AlertStatus,
+    sent_at: Option<chrono::DateTime<Utc>>,
+) -> Result<Alert, ApiError> {
+    let row = sqlx::query(
+        r#"
+        UPDATE alerts
+        SET status = $2::alert_status, sent_at = $3
+        WHERE id = $1
+        RETURNING id, organization_id, finding_id, notification_channel_id, status::text AS status,
+            payload, created_at, sent_at
+        "#,
+    )
+    .bind(alert_id)
+    .bind(alert_status_slug(status))
+    .bind(sent_at)
+    .fetch_one(pool)
+    .await
+    .map_err(map_sql_error)?;
+    Ok(alert_from_row(&row))
+}
+
+async fn record_audit(
+    pool: &PgPool,
+    organization_id: Option<Uuid>,
+    actor_user_id: Option<Uuid>,
+    action: &str,
+    target_type: &str,
+    target_id: Option<Uuid>,
+    metadata: Value,
+) -> Result<(), ApiError> {
+    sqlx::query(
+        r#"
+        INSERT INTO audit_logs
+            (id, organization_id, actor_user_id, action, target_type, target_id, metadata)
+        VALUES ($1, $2, $3, $4, $5, $6, $7)
+        "#,
+    )
+    .bind(Uuid::now_v7())
+    .bind(organization_id)
+    .bind(actor_user_id)
+    .bind(action)
+    .bind(target_type)
+    .bind(target_id)
+    .bind(metadata)
+    .execute(pool)
+    .await
+    .map_err(map_sql_error)?;
+    Ok(())
+}
+
+async fn require_user(pool: &PgPool, user_id: Uuid) -> Result<UserAccount, ApiError> {
+    let row = sqlx::query("SELECT id, email, display_name, created_at FROM users WHERE id = $1")
+        .bind(user_id)
+        .fetch_optional(pool)
+        .await
+        .map_err(map_sql_error)?
+        .ok_or_else(|| ApiError::unauthorized("user does not exist"))?;
+    Ok(user_from_row(&row))
+}
+
+async fn require_membership(
+    pool: &PgPool,
+    user_id: Uuid,
+    organization_id: Uuid,
+) -> Result<MemberRole, ApiError> {
+    require_user(pool, user_id).await?;
+    if organization_by_id(pool, organization_id).await?.is_none() {
+        return Err(ApiError::not_found("organization does not exist"));
+    }
+    let row = sqlx::query(
+        "SELECT role::text AS role FROM organization_members WHERE organization_id = $1 AND user_id = $2",
+    )
+    .bind(organization_id)
+    .bind(user_id)
+    .fetch_optional(pool)
+    .await
+    .map_err(map_sql_error)?
+    .ok_or_else(|| ApiError::forbidden("user is not a member of this organization"))?;
+    Ok(parse_member_role(row.get("role")))
+}
+
+async fn require_asset_in_org(
+    pool: &PgPool,
+    organization_id: Uuid,
+    asset_id: Uuid,
+) -> Result<DomainAsset, ApiError> {
+    let row = sqlx::query(
+        r#"
+        SELECT id, organization_id, value, authorization_attested_by,
+            authorization_attested_at, created_at
+        FROM assets
+        WHERE id = $1 AND organization_id = $2
+        "#,
+    )
+    .bind(asset_id)
+    .bind(organization_id)
+    .fetch_optional(pool)
+    .await
+    .map_err(map_sql_error)?
+    .ok_or_else(|| ApiError::not_found("domain asset does not exist"))?;
+    Ok(domain_asset_from_row(&row))
+}
+
+async fn require_finding_in_org(
+    pool: &PgPool,
+    organization_id: Uuid,
+    finding_id: Uuid,
+) -> Result<Finding, ApiError> {
+    let row = sqlx::query(
+        r#"
+        SELECT id, organization_id, asset_id, rule_id, title, severity::text AS severity,
+            confidence::text AS confidence, status::text AS status, evidence, remediation,
+            first_seen_at, last_seen_at
+        FROM findings
+        WHERE id = $1 AND organization_id = $2
+        "#,
+    )
+    .bind(finding_id)
+    .bind(organization_id)
+    .fetch_optional(pool)
+    .await
+    .map_err(map_sql_error)?
+    .ok_or_else(|| ApiError::not_found("finding does not exist"))?;
+    Ok(finding_from_row(&row))
+}
+
+async fn scan_result_by_id(
+    pool: &PgPool,
+    organization_id: Uuid,
+    scan_result_id: Uuid,
+) -> Result<ScanResult, ApiError> {
+    let row = sqlx::query(
+        r#"
+        SELECT scan_results.id, scan_results.scan_job_id, scan_results.asset_id,
+            scan_jobs.organization_id, scan_results.source, scan_results.observed_at,
+            scan_results.evidence
+        FROM scan_results
+        INNER JOIN scan_jobs ON scan_jobs.id = scan_results.scan_job_id
+        WHERE scan_results.id = $1 AND scan_jobs.organization_id = $2
+        "#,
+    )
+    .bind(scan_result_id)
+    .bind(organization_id)
+    .fetch_optional(pool)
+    .await
+    .map_err(map_sql_error)?
+    .ok_or_else(|| ApiError::not_found("scan result does not exist"))?;
+    scan_result_from_row(&row)
+}
+
+async fn find_user_by_email(
+    pool: &PgPool,
+    email: &str,
+) -> Result<Option<(UserAccount, String)>, ApiError> {
+    let row = sqlx::query(
+        "SELECT id, email, display_name, password_hash, created_at FROM users WHERE email = $1",
+    )
+    .bind(email)
+    .fetch_optional(pool)
+    .await
+    .map_err(map_sql_error)?;
+    Ok(row.map(|row| (user_from_row(&row), row.get("password_hash"))))
+}
+
+async fn organization_by_id(
+    pool: &PgPool,
+    organization_id: Uuid,
+) -> Result<Option<Organization>, ApiError> {
+    let row = sqlx::query("SELECT id, name, slug, created_at FROM organizations WHERE id = $1")
+        .bind(organization_id)
+        .fetch_optional(pool)
+        .await
+        .map_err(map_sql_error)?;
+    Ok(row.map(|row| organization_from_row(&row)))
+}
+
+async fn organization_by_slug(pool: &PgPool, slug: &str) -> Result<Option<Organization>, ApiError> {
+    let row = sqlx::query("SELECT id, name, slug, created_at FROM organizations WHERE slug = $1")
+        .bind(slug)
+        .fetch_optional(pool)
+        .await
+        .map_err(map_sql_error)?;
+    Ok(row.map(|row| organization_from_row(&row)))
+}
+
+async fn list_members(
+    pool: &PgPool,
+    organization_id: Uuid,
+) -> Result<Vec<OrganizationMember>, ApiError> {
+    let rows = sqlx::query(
+        r#"
+        SELECT users.id, users.email, users.display_name, users.created_at AS user_created_at,
+            organization_members.role::text AS role,
+            organization_members.created_at AS membership_created_at
+        FROM organization_members
+        INNER JOIN users ON users.id = organization_members.user_id
+        WHERE organization_members.organization_id = $1
+        ORDER BY users.email ASC
+        "#,
+    )
+    .bind(organization_id)
+    .fetch_all(pool)
+    .await
+    .map_err(map_sql_error)?;
+    Ok(rows.iter().map(organization_member_from_row).collect())
+}
+
+async fn active_alert_for_finding(
+    pool: &PgPool,
+    finding_id: Uuid,
+) -> Result<Option<Alert>, ApiError> {
+    let row = sqlx::query(
+        r#"
+        SELECT id, organization_id, finding_id, notification_channel_id, status::text AS status,
+            payload, created_at, sent_at
+        FROM alerts
+        WHERE finding_id = $1 AND status IN ('queued', 'sent')
+        ORDER BY created_at DESC
+        LIMIT 1
+        "#,
+    )
+    .bind(finding_id)
+    .fetch_optional(pool)
+    .await
+    .map_err(map_sql_error)?;
+    Ok(row.map(|row| alert_from_row(&row)))
+}
+
+async fn first_enabled_slack_channel(
+    pool: &PgPool,
+    organization_id: Uuid,
+) -> Result<Option<SlackNotificationChannel>, ApiError> {
+    let row = sqlx::query(
+        r#"
+        SELECT id, organization_id, name, enabled, created_at
+        FROM notification_channels
+        WHERE organization_id = $1 AND kind = 'slack' AND enabled = true
+        ORDER BY created_at ASC
+        LIMIT 1
+        "#,
+    )
+    .bind(organization_id)
+    .fetch_optional(pool)
+    .await
+    .map_err(map_sql_error)?;
+    Ok(row.map(|row| slack_channel_from_row(&row)))
+}
+
+async fn domain_for_asset(pool: &PgPool, asset_id: Uuid) -> Result<Option<String>, ApiError> {
+    let row = sqlx::query("SELECT value FROM assets WHERE id = $1")
+        .bind(asset_id)
+        .fetch_optional(pool)
+        .await
+        .map_err(map_sql_error)?;
+    Ok(row.map(|row| row.get("value")))
+}
+
+fn user_from_row(row: &PgRow) -> UserAccount {
+    UserAccount {
+        id: row.get("id"),
+        email: row.get("email"),
+        display_name: row.get("display_name"),
+        created_at: row.get("created_at"),
+    }
+}
+
+fn organization_from_row(row: &PgRow) -> Organization {
+    Organization {
+        id: row.get("id"),
+        name: row.get("name"),
+        slug: row.get("slug"),
+        created_at: row.get("created_at"),
+    }
+}
+
+fn membership_from_row(row: &PgRow) -> OrganizationMembership {
+    OrganizationMembership {
+        organization_id: row.get("organization_id"),
+        user_id: row.get("user_id"),
+        role: parse_member_role(row.get("role")),
+        created_at: row.get("created_at"),
+    }
+}
+
+fn organization_member_from_row(row: &PgRow) -> OrganizationMember {
+    OrganizationMember {
+        user: UserAccount {
+            id: row.get("id"),
+            email: row.get("email"),
+            display_name: row.get("display_name"),
+            created_at: row.get("user_created_at"),
+        },
+        role: parse_member_role(row.get("role")),
+        created_at: row.get("membership_created_at"),
+    }
+}
+
+fn invite_from_row(row: &PgRow) -> OrganizationInvite {
+    OrganizationInvite {
+        id: row.get("id"),
+        organization_id: row.get("organization_id"),
+        email: row.get("email"),
+        role: parse_member_role(row.get("role")),
+        token: row.get("token_hash"),
+        invited_by: row.get("invited_by"),
+        accepted_at: row.get("accepted_at"),
+        created_at: row.get("created_at"),
+    }
+}
+
+fn domain_asset_from_row(row: &PgRow) -> DomainAsset {
+    DomainAsset {
+        id: row.get("id"),
+        organization_id: row.get("organization_id"),
+        domain: row.get("value"),
+        authorization_attested_by: row.get("authorization_attested_by"),
+        authorization_attested_at: row.get("authorization_attested_at"),
+        created_at: row.get("created_at"),
+    }
+}
+
+fn scan_job_from_row(row: &PgRow) -> ScanJob {
+    ScanJob {
+        id: row.get("id"),
+        organization_id: row.get("organization_id"),
+        asset_id: row.get("asset_id"),
+        requested_by: row.get("requested_by"),
+        status: parse_scan_status(row.get("status")),
+        reason: row.get("reason"),
+        created_at: row.get("created_at"),
+        started_at: row.get("started_at"),
+        completed_at: row.get("completed_at"),
+    }
+}
+
+fn scan_result_from_row(row: &PgRow) -> Result<ScanResult, ApiError> {
+    let evidence: Value = row.get("evidence");
+    Ok(ScanResult {
+        id: row.get("id"),
+        organization_id: row.get("organization_id"),
+        asset_id: row.get("asset_id"),
+        scan_job_id: row.get("scan_job_id"),
+        source: row.get("source"),
+        observed_at: row.get("observed_at"),
+        evidence: serde_json::from_value(evidence).map_err(|_| ApiError::internal())?,
+    })
+}
+
+fn finding_from_row(row: &PgRow) -> Finding {
+    Finding {
+        id: row.get("id"),
+        organization_id: row.get("organization_id"),
+        asset_id: row.get("asset_id"),
+        rule_id: row.get("rule_id"),
+        title: row.get("title"),
+        severity: parse_severity(row.get("severity")),
+        status: parse_finding_status(row.get("status")),
+        confidence: parse_confidence(row.get("confidence")),
+        evidence: row.get("evidence"),
+        remediation: row.get("remediation"),
+        first_seen_at: row.get("first_seen_at"),
+        last_seen_at: row.get("last_seen_at"),
+    }
+}
+
+fn finding_event_from_row(row: &PgRow) -> FindingEvent {
+    FindingEvent {
+        id: row.get("id"),
+        organization_id: row.get("organization_id"),
+        finding_id: row.get("finding_id"),
+        actor_user_id: row.get("actor_user_id"),
+        event_type: row.get("event_type"),
+        note: row.get("note"),
+        created_at: row.get("created_at"),
+    }
+}
+
+fn slack_channel_from_row(row: &PgRow) -> SlackNotificationChannel {
+    SlackNotificationChannel {
+        id: row.get("id"),
+        organization_id: row.get("organization_id"),
+        name: row.get("name"),
+        enabled: row.get("enabled"),
+        created_at: row.get("created_at"),
+    }
+}
+
+fn alert_from_row(row: &PgRow) -> Alert {
+    let payload: Value = row.get("payload");
+    let payload = payload
+        .get("text")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .unwrap_or_else(|| payload.to_string());
+    Alert {
+        id: row.get("id"),
+        organization_id: row.get("organization_id"),
+        finding_id: row.get("finding_id"),
+        notification_channel_id: row.get("notification_channel_id"),
+        status: parse_alert_status(row.get("status")),
+        payload,
+        created_at: row.get("created_at"),
+        sent_at: row.get("sent_at"),
+    }
+}
+
+fn remediation_task_from_row(row: &PgRow) -> RemediationTask {
+    RemediationTask {
+        id: row.get("id"),
+        organization_id: row.get("organization_id"),
+        finding_id: row.get("finding_id"),
+        title: row.get("title"),
+        status: parse_remediation_status(row.get("status")),
+        assignee: row.get("assignee"),
+        created_at: row.get("created_at"),
+        updated_at: row.get("updated_at"),
+    }
+}
+
+fn audit_log_from_row(row: &PgRow) -> AuditLog {
+    AuditLog {
+        id: row.get("id"),
+        organization_id: row.get("organization_id"),
+        actor_user_id: row.get("actor_user_id"),
+        action: row.get("action"),
+        target_type: row.get("target_type"),
+        target_id: row.get("target_id"),
+        metadata: row.get("metadata"),
+        created_at: row.get("created_at"),
+    }
 }
 
 fn normalize_email(input: &str) -> Result<String, ApiError> {
     let email = input.trim().to_ascii_lowercase();
-
     if email.len() < 6 || !email.contains('@') || !email.contains('.') {
         return Err(ApiError::bad_request("email must be a valid address"));
     }
-
     Ok(email)
 }
 
 fn validate_display_name(input: &str) -> Result<String, ApiError> {
     let display_name = input.trim();
-
     if display_name.len() < 2 {
         return Err(ApiError::bad_request(
             "display name must be at least 2 characters",
         ));
     }
-
     Ok(display_name.to_string())
 }
 
 fn validate_organization_name(input: &str) -> Result<String, ApiError> {
     let name = input.trim();
-
     if name.len() < 2 {
         return Err(ApiError::bad_request(
             "organization name must be at least 2 characters",
         ));
     }
-
     Ok(name.to_string())
 }
 
 fn validate_channel_name(input: &str) -> Result<String, ApiError> {
     let name = input.trim();
-
     if name.len() < 2 || name.len() > 80 {
         return Err(ApiError::bad_request(
             "channel name must be between 2 and 80 characters",
         ));
     }
-
     Ok(name.to_string())
 }
 
 fn validate_slack_webhook_url(input: &str) -> Result<String, ApiError> {
     let webhook_url = input.trim();
-
     if !webhook_url.starts_with("https://hooks.slack.com/") {
         return Err(ApiError::bad_request(
             "Slack webhook URL must start with https://hooks.slack.com/",
         ));
     }
-
     Ok(webhook_url.to_string())
 }
 
 fn validate_task_title(input: String) -> Result<String, ApiError> {
     let title = input.trim();
-
     if title.len() < 3 || title.len() > 160 {
         return Err(ApiError::bad_request(
             "task title must be between 3 and 160 characters",
         ));
     }
-
     Ok(title.to_string())
 }
 
 fn validate_required_note(input: &str) -> Result<String, ApiError> {
     let note = input.trim();
-
     if note.len() < 3 || note.len() > 1_000 {
         return Err(ApiError::bad_request(
             "note must be between 3 and 1000 characters",
         ));
     }
-
     Ok(note.to_string())
 }
 
@@ -1620,82 +2009,19 @@ fn validate_optional_text(
         return Ok(None);
     };
     let value = value.trim();
-
     if value.is_empty() {
         return Ok(None);
     }
-
     if value.len() > max_len {
         return Err(ApiError::bad_request(format!(
             "{field_name} must be {max_len} characters or fewer",
         )));
     }
-
     Ok(Some(value.to_string()))
 }
 
-fn finding_status_slug(status: FindingStatus) -> &'static str {
-    match status {
-        FindingStatus::Open => "open",
-        FindingStatus::AcceptedRisk => "accepted_risk",
-        FindingStatus::FalsePositive => "false_positive",
-        FindingStatus::InProgress => "in_progress",
-        FindingStatus::Remediated => "remediated",
-        FindingStatus::Reopened => "reopened",
-    }
-}
-
-fn remediation_status_slug(status: RemediationStatus) -> &'static str {
-    match status {
-        RemediationStatus::Open => "open",
-        RemediationStatus::InProgress => "in_progress",
-        RemediationStatus::Blocked => "blocked",
-        RemediationStatus::Remediated => "remediated",
-        RemediationStatus::AcceptedRisk => "accepted_risk",
-        RemediationStatus::FalsePositive => "false_positive",
-    }
-}
-
-fn record_audit(
-    repository: &mut InMemoryRepository,
-    organization_id: Option<Uuid>,
-    actor_user_id: Option<Uuid>,
-    action: &str,
-    target_type: &str,
-    target_id: Option<Uuid>,
-    metadata: Value,
-) {
-    let log = AuditLog {
-        id: Uuid::now_v7(),
-        organization_id,
-        actor_user_id,
-        action: action.to_string(),
-        target_type: target_type.to_string(),
-        target_id,
-        metadata,
-        created_at: Utc::now(),
-    };
-
-    repository.audit_logs_by_id.insert(log.id, log);
-}
-
 fn validate_scan_reason(input: Option<String>) -> Result<Option<String>, ApiError> {
-    let Some(reason) = input else {
-        return Ok(None);
-    };
-    let reason = reason.trim();
-
-    if reason.is_empty() {
-        return Ok(None);
-    }
-
-    if reason.len() > 240 {
-        return Err(ApiError::bad_request(
-            "scan reason must be 240 characters or fewer",
-        ));
-    }
-
-    Ok(Some(reason.to_string()))
+    validate_optional_text(input, "scan reason", 240)
 }
 
 fn session_for_user(user_id: Uuid) -> Result<SessionToken, ApiError> {
@@ -1733,36 +2059,153 @@ fn current_user_id(headers: &HeaderMap) -> Result<Uuid, ApiError> {
 
     let value = headers
         .get("x-ceem-user-id")
-        .ok_or_else(|| ApiError::unauthorized("x-ceem-user-id header is required"))?;
+        .ok_or_else(|| ApiError::unauthorized("authorization header is required"))?;
     let value = value
         .to_str()
         .map_err(|_| ApiError::unauthorized("x-ceem-user-id must be a UUID"))?;
-
     Uuid::parse_str(value).map_err(|_| ApiError::unauthorized("x-ceem-user-id must be a UUID"))
 }
 
-impl InMemoryRepository {
-    fn require_membership(
-        &self,
-        user_id: Uuid,
-        organization_id: Uuid,
-    ) -> Result<MemberRole, ApiError> {
-        if !self.users_by_id.contains_key(&user_id) {
-            return Err(ApiError::unauthorized("user does not exist"));
-        }
-
-        if !self.organizations_by_id.contains_key(&organization_id) {
-            return Err(ApiError::not_found("organization does not exist"));
-        }
-
-        self.memberships
-            .iter()
-            .find(|membership| {
-                membership.user_id == user_id && membership.organization_id == organization_id
-            })
-            .map(|membership| membership.role)
-            .ok_or_else(|| ApiError::forbidden("user is not a member of this organization"))
+fn member_role_slug(role: MemberRole) -> &'static str {
+    match role {
+        MemberRole::Owner => "owner",
+        MemberRole::Admin => "admin",
+        MemberRole::Member => "member",
+        MemberRole::Viewer => "viewer",
     }
+}
+
+fn parse_member_role(value: &str) -> MemberRole {
+    match value {
+        "owner" => MemberRole::Owner,
+        "admin" => MemberRole::Admin,
+        "member" => MemberRole::Member,
+        "viewer" => MemberRole::Viewer,
+        _ => MemberRole::Viewer,
+    }
+}
+
+fn parse_scan_status(value: &str) -> ScanStatus {
+    match value {
+        "queued" => ScanStatus::Queued,
+        "running" => ScanStatus::Running,
+        "completed" => ScanStatus::Completed,
+        "failed" => ScanStatus::Failed,
+        "canceled" => ScanStatus::Canceled,
+        _ => ScanStatus::Failed,
+    }
+}
+
+fn severity_slug(severity: Severity) -> &'static str {
+    match severity {
+        Severity::Info => "info",
+        Severity::Low => "low",
+        Severity::Medium => "medium",
+        Severity::High => "high",
+        Severity::Critical => "critical",
+    }
+}
+
+fn parse_severity(value: &str) -> Severity {
+    match value {
+        "info" => Severity::Info,
+        "low" => Severity::Low,
+        "medium" => Severity::Medium,
+        "high" => Severity::High,
+        "critical" => Severity::Critical,
+        _ => Severity::Info,
+    }
+}
+
+fn confidence_slug(confidence: Confidence) -> &'static str {
+    match confidence {
+        Confidence::Low => "low",
+        Confidence::Medium => "medium",
+        Confidence::High => "high",
+    }
+}
+
+fn parse_confidence(value: &str) -> Confidence {
+    match value {
+        "low" => Confidence::Low,
+        "medium" => Confidence::Medium,
+        "high" => Confidence::High,
+        _ => Confidence::Low,
+    }
+}
+
+fn finding_status_slug(status: FindingStatus) -> &'static str {
+    match status {
+        FindingStatus::Open => "open",
+        FindingStatus::AcceptedRisk => "accepted_risk",
+        FindingStatus::FalsePositive => "false_positive",
+        FindingStatus::InProgress => "in_progress",
+        FindingStatus::Remediated => "remediated",
+        FindingStatus::Reopened => "reopened",
+    }
+}
+
+fn parse_finding_status(value: &str) -> FindingStatus {
+    match value {
+        "open" => FindingStatus::Open,
+        "accepted_risk" => FindingStatus::AcceptedRisk,
+        "false_positive" => FindingStatus::FalsePositive,
+        "in_progress" => FindingStatus::InProgress,
+        "remediated" => FindingStatus::Remediated,
+        "reopened" => FindingStatus::Reopened,
+        _ => FindingStatus::Open,
+    }
+}
+
+fn alert_status_slug(status: AlertStatus) -> &'static str {
+    match status {
+        AlertStatus::Queued => "queued",
+        AlertStatus::Sent => "sent",
+        AlertStatus::Failed => "failed",
+        AlertStatus::Suppressed => "suppressed",
+    }
+}
+
+fn parse_alert_status(value: &str) -> AlertStatus {
+    match value {
+        "queued" => AlertStatus::Queued,
+        "sent" => AlertStatus::Sent,
+        "failed" => AlertStatus::Failed,
+        "suppressed" => AlertStatus::Suppressed,
+        _ => AlertStatus::Failed,
+    }
+}
+
+fn remediation_status_slug(status: RemediationStatus) -> &'static str {
+    match status {
+        RemediationStatus::Open => "open",
+        RemediationStatus::InProgress => "in_progress",
+        RemediationStatus::Blocked => "blocked",
+        RemediationStatus::Remediated => "remediated",
+        RemediationStatus::AcceptedRisk => "accepted_risk",
+        RemediationStatus::FalsePositive => "false_positive",
+    }
+}
+
+fn parse_remediation_status(value: &str) -> RemediationStatus {
+    match value {
+        "open" => RemediationStatus::Open,
+        "in_progress" => RemediationStatus::InProgress,
+        "blocked" => RemediationStatus::Blocked,
+        "remediated" => RemediationStatus::Remediated,
+        "accepted_risk" => RemediationStatus::AcceptedRisk,
+        "false_positive" => RemediationStatus::FalsePositive,
+        _ => RemediationStatus::Open,
+    }
+}
+
+fn map_sql_error(error: sqlx::Error) -> ApiError {
+    if let sqlx::Error::Database(database_error) = &error
+        && database_error.is_unique_violation()
+    {
+        return ApiError::conflict("resource already exists");
+    }
+    ApiError::internal()
 }
 
 #[derive(Debug)]
@@ -1862,19 +2305,6 @@ mod tests {
     }
 
     #[test]
-    fn denies_non_membership() {
-        let repository = InMemoryRepository::default();
-
-        assert_eq!(
-            repository
-                .require_membership(Uuid::now_v7(), Uuid::now_v7())
-                .unwrap_err()
-                .status,
-            StatusCode::UNAUTHORIZED
-        );
-    }
-
-    #[test]
     fn trims_scan_reason() {
         assert_eq!(
             validate_scan_reason(Some(" certificate rotation ".to_string())).unwrap(),
@@ -1896,10 +2326,15 @@ mod tests {
     }
 
     #[test]
-    fn exposes_finding_status_slugs() {
+    fn maps_database_status_slugs() {
+        assert_eq!(parse_scan_status("queued"), ScanStatus::Queued);
         assert_eq!(
             finding_status_slug(FindingStatus::AcceptedRisk),
             "accepted_risk"
+        );
+        assert_eq!(
+            parse_remediation_status("blocked"),
+            RemediationStatus::Blocked
         );
     }
 }

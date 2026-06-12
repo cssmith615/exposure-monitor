@@ -74,3 +74,21 @@
 - Build static frontend.
 - Add production configuration doc.
 - Add cloud deployment guide.
+
+## Epic 9: CEEM Agent
+
+- Create `ceem-agent` Rust crate.
+- Add agent enrollment tokens.
+- Add agent identity, heartbeat, and capability model.
+- Add DB-backed agent job queue.
+- Package agent for RHEL with RPM and systemd.
+- Collect local certificate inventory and approved host posture evidence.
+- Add agent inventory and job history screens.
+
+## Epic 10: AI-Native Operations
+
+- Add grounded evidence summaries for scan results and findings.
+- Add triage recommendations with citations to CEEM data.
+- Add human approval gates for scope expansion, suppression, and accepted risk.
+- Add watcher for noisy alerts and stale remediation.
+- Add operator copilot design without autonomous external actions.

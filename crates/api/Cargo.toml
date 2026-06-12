@@ -11,12 +11,14 @@ anyhow.workspace = true
 axum.workspace = true
 ceem-auth = { path = "../auth" }
 ceem-alerts = { path = "../alerts" }
+ceem-db = { path = "../db" }
 ceem-findings = { path = "../findings" }
 ceem-scanner = { path = "../scanner" }
 ceem-shared = { path = "../shared" }
 chrono.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+sqlx.workspace = true
 tokio.workspace = true
 tower-http.workspace = true
 tracing.workspace = true
