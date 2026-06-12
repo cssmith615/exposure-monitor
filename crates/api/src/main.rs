@@ -1,7 +1,12 @@
+use std::{
+    collections::{HashMap, VecDeque},
+    sync::{Mutex, OnceLock},
+};
+
 use axum::{
     Json, Router,
     extract::{FromRef, Path, State},
-    http::{HeaderMap, StatusCode},
+    http::{HeaderMap, HeaderValue, Method, StatusCode},
     response::{IntoResponse, Response},
     routing::{get, post},
 };
@@ -19,21 +24,26 @@ use ceem_shared::{
     CreateFindingNoteResponse, CreateOrganizationInviteRequest, CreateOrganizationInviteResponse,
     CreateOrganizationRequest, CreateOrganizationResponse, CreateRemediationTaskRequest,
     CreateRemediationTaskResponse, CreateScanJobRequest, CreateScanJobResponse,
-    CreateSlackChannelRequest, CreateSlackChannelResponse, DeriveFindingsResponse, DomainAsset,
-    Finding, FindingEvent, FindingStatus, HealthResponse, LoginRequest, LoginResponse, MemberRole,
-    Organization, OrganizationInvite, OrganizationMember, OrganizationMembership,
-    OrganizationSummary, PRODUCT_NAME, QueueSlackAlertResponse, RegisterUserRequest,
-    RegisterUserResponse, RemediationStatus, RemediationTask, RunDnsBaselineScanResponse,
-    ScanEvidence, ScanJob, ScanResult, ScanStatus, ServiceStatus, SessionToken, Severity,
+    CreateScheduledScanRequest, CreateSlackChannelRequest, CreateSlackChannelResponse,
+    DeriveFindingsResponse, DomainAsset, Finding, FindingEvent, FindingStatus, HealthResponse,
+    LoginRequest, LoginResponse, MemberRole, Organization, OrganizationInvite, OrganizationMember,
+    OrganizationMembership, OrganizationSummary, PRODUCT_NAME, QueueSlackAlertResponse,
+    RegisterUserRequest, RegisterUserResponse, RemediationStatus, RemediationTask,
+    RunDnsBaselineScanResponse, ScanCadence, ScanEvidence, ScanJob, ScanProfile, ScanResult,
+    ScanStatus, ScheduledScan, ScheduledScanResponse, ServiceStatus, SessionToken, Severity,
     SlackNotificationChannel, UpdateFindingStatusRequest, UpdateFindingStatusResponse,
     UpdateMemberRoleRequest, UpdateMemberRoleResponse, UpdateRemediationStatusRequest,
-    UpdateRemediationStatusResponse, UserAccount, validate_domain, validate_slug,
+    UpdateRemediationStatusResponse, UpdateScheduledScanRequest, UserAccount,
+    calculate_finding_risk_score, finding_risk_factors, validate_domain, validate_slug,
 };
-use chrono::Utc;
+use chrono::{Duration, Utc};
 use serde::Serialize;
 use serde_json::{Value, json};
 use sqlx::{PgPool, Row, postgres::PgRow};
-use tower_http::{cors::CorsLayer, trace::TraceLayer};
+use tower_http::{
+    cors::{Any, CorsLayer},
+    trace::TraceLayer,
+};
 use tracing::info;
 use tracing_subscriber::{EnvFilter, fmt};
 use uuid::Uuid;
@@ -92,6 +102,22 @@ fn app(pool: PgPool) -> Router {
         .route(
             "/v1/organizations/{organization_id}/scan-jobs",
             get(list_scan_jobs),
+        )
+        .route(
+            "/v1/organizations/{organization_id}/scheduled-scans",
+            get(list_scheduled_scans),
+        )
+        .route(
+            "/v1/organizations/{organization_id}/domain-assets/{asset_id}/scheduled-scans",
+            post(create_scheduled_scan),
+        )
+        .route(
+            "/v1/organizations/{organization_id}/scheduled-scans/{scheduled_scan_id}",
+            post(update_scheduled_scan),
+        )
+        .route(
+            "/v1/organizations/{organization_id}/scheduled-scans/{scheduled_scan_id}/pause",
+            post(pause_scheduled_scan),
         )
         .route(
             "/v1/organizations/{organization_id}/scan-jobs/{scan_job_id}/run-dns-baseline",
@@ -158,7 +184,7 @@ fn app(pool: PgPool) -> Router {
             get(list_audit_logs),
         )
         .with_state(state)
-        .layer(CorsLayer::permissive())
+        .layer(cors_layer())
         .layer(TraceLayer::new_for_http())
 }
 
@@ -173,6 +199,23 @@ async fn healthz() -> Json<HealthResponse> {
 fn init_tracing() {
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
     fmt().with_env_filter(filter).json().init();
+}
+
+fn cors_layer() -> CorsLayer {
+    let methods = [Method::GET, Method::POST, Method::OPTIONS];
+    if let Ok(origin) = std::env::var("CEEM_CORS_ORIGIN")
+        && let Ok(origin) = HeaderValue::from_str(&origin)
+    {
+        return CorsLayer::new()
+            .allow_origin(origin)
+            .allow_methods(methods)
+            .allow_headers(Any);
+    }
+
+    CorsLayer::new()
+        .allow_origin(Any)
+        .allow_methods(methods)
+        .allow_headers(Any)
 }
 
 #[derive(Clone)]
@@ -191,6 +234,7 @@ async fn register_user(
     Json(request): Json<RegisterUserRequest>,
 ) -> Result<Json<RegisterUserResponse>, ApiError> {
     let email = normalize_email(&request.email)?;
+    enforce_auth_rate_limit(&email)?;
     let display_name = validate_display_name(&request.display_name)?;
     validate_password_policy(&request.password, &PasswordPolicy::default())
         .map_err(|error| ApiError::bad_request(error.to_string()))?;
@@ -217,6 +261,16 @@ async fn register_user(
 
     let user = user_from_row(&row);
     let session = session_for_user(user.id)?;
+    record_audit(
+        &pool,
+        None,
+        Some(user.id),
+        "auth.registered",
+        "user",
+        Some(user.id),
+        json!({ "email": user.email }),
+    )
+    .await?;
 
     Ok(Json(RegisterUserResponse { user, session }))
 }
@@ -226,6 +280,7 @@ async fn login_user(
     Json(request): Json<LoginRequest>,
 ) -> Result<Json<LoginResponse>, ApiError> {
     let email = normalize_email(&request.email)?;
+    enforce_auth_rate_limit(&email)?;
     let (user, password_hash) = find_user_by_email(&pool, &email)
         .await?
         .ok_or_else(|| ApiError::unauthorized("email or password is incorrect"))?;
@@ -235,6 +290,16 @@ async fn login_user(
     }
 
     let session = session_for_user(user.id)?;
+    record_audit(
+        &pool,
+        None,
+        Some(user.id),
+        "auth.login",
+        "user",
+        Some(user.id),
+        json!({ "email": user.email }),
+    )
+    .await?;
 
     Ok(Json(LoginResponse { user, session }))
 }
@@ -664,6 +729,188 @@ async fn list_scan_jobs(
     Ok(Json(rows.iter().map(scan_job_from_row).collect()))
 }
 
+async fn list_scheduled_scans(
+    State(pool): State<PgPool>,
+    headers: HeaderMap,
+    Path(organization_id): Path<Uuid>,
+) -> Result<Json<Vec<ScheduledScan>>, ApiError> {
+    let user_id = current_user_id(&headers)?;
+    require_membership(&pool, user_id, organization_id).await?;
+    let rows = sqlx::query(
+        r#"
+        SELECT id, organization_id, asset_id, cadence::text AS cadence, profile::text AS profile,
+            enabled, next_run_at, last_enqueued_at, created_by, created_at, updated_at
+        FROM scheduled_scans
+        WHERE organization_id = $1
+        ORDER BY enabled DESC, next_run_at ASC NULLS LAST, updated_at DESC
+        "#,
+    )
+    .bind(organization_id)
+    .fetch_all(&pool)
+    .await
+    .map_err(map_sql_error)?;
+
+    Ok(Json(rows.iter().map(scheduled_scan_from_row).collect()))
+}
+
+async fn create_scheduled_scan(
+    State(pool): State<PgPool>,
+    headers: HeaderMap,
+    Path((organization_id, asset_id)): Path<(Uuid, Uuid)>,
+    Json(request): Json<CreateScheduledScanRequest>,
+) -> Result<Json<ScheduledScanResponse>, ApiError> {
+    let user_id = current_user_id(&headers)?;
+    let role = require_membership(&pool, user_id, organization_id).await?;
+    if matches!(role, MemberRole::Viewer) {
+        return Err(ApiError::forbidden(
+            "viewers cannot configure scan schedules",
+        ));
+    }
+    require_asset_in_org(&pool, organization_id, asset_id).await?;
+    let next_run_at = next_run_for_cadence(request.cadence);
+    let row = sqlx::query(
+        r#"
+        INSERT INTO scheduled_scans (
+            id, organization_id, asset_id, cadence, profile, enabled, next_run_at, created_by
+        )
+        VALUES ($1, $2, $3, $4::scan_cadence, $5::scan_profile, true, $6, $7)
+        ON CONFLICT (asset_id, profile)
+        DO UPDATE SET
+            cadence = EXCLUDED.cadence,
+            enabled = true,
+            next_run_at = EXCLUDED.next_run_at,
+            updated_at = now()
+        RETURNING id, organization_id, asset_id, cadence::text AS cadence, profile::text AS profile,
+            enabled, next_run_at, last_enqueued_at, created_by, created_at, updated_at
+        "#,
+    )
+    .bind(Uuid::now_v7())
+    .bind(organization_id)
+    .bind(asset_id)
+    .bind(scan_cadence_slug(request.cadence))
+    .bind(scan_profile_slug(request.profile))
+    .bind(next_run_at)
+    .bind(user_id)
+    .fetch_one(&pool)
+    .await
+    .map_err(map_sql_error)?;
+    let scheduled_scan = scheduled_scan_from_row(&row);
+    record_audit(
+        &pool,
+        Some(organization_id),
+        Some(user_id),
+        "scheduled_scan.upserted",
+        "scheduled_scan",
+        Some(scheduled_scan.id),
+        json!({
+            "asset_id": asset_id,
+            "cadence": scan_cadence_slug(scheduled_scan.cadence),
+            "profile": scan_profile_slug(scheduled_scan.profile)
+        }),
+    )
+    .await?;
+
+    Ok(Json(ScheduledScanResponse { scheduled_scan }))
+}
+
+async fn update_scheduled_scan(
+    State(pool): State<PgPool>,
+    headers: HeaderMap,
+    Path((organization_id, scheduled_scan_id)): Path<(Uuid, Uuid)>,
+    Json(request): Json<UpdateScheduledScanRequest>,
+) -> Result<Json<ScheduledScanResponse>, ApiError> {
+    let user_id = current_user_id(&headers)?;
+    let role = require_membership(&pool, user_id, organization_id).await?;
+    if matches!(role, MemberRole::Viewer) {
+        return Err(ApiError::forbidden("viewers cannot update scan schedules"));
+    }
+    let next_run_at = if request.enabled {
+        next_run_for_cadence(request.cadence)
+    } else {
+        None
+    };
+    let row = sqlx::query(
+        r#"
+        UPDATE scheduled_scans
+        SET cadence = $3::scan_cadence,
+            profile = $4::scan_profile,
+            enabled = $5,
+            next_run_at = $6,
+            updated_at = now()
+        WHERE id = $1 AND organization_id = $2
+        RETURNING id, organization_id, asset_id, cadence::text AS cadence, profile::text AS profile,
+            enabled, next_run_at, last_enqueued_at, created_by, created_at, updated_at
+        "#,
+    )
+    .bind(scheduled_scan_id)
+    .bind(organization_id)
+    .bind(scan_cadence_slug(request.cadence))
+    .bind(scan_profile_slug(request.profile))
+    .bind(request.enabled)
+    .bind(next_run_at)
+    .fetch_optional(&pool)
+    .await
+    .map_err(map_sql_error)?
+    .ok_or_else(|| ApiError::not_found("scheduled scan does not exist"))?;
+    let scheduled_scan = scheduled_scan_from_row(&row);
+    record_audit(
+        &pool,
+        Some(organization_id),
+        Some(user_id),
+        "scheduled_scan.updated",
+        "scheduled_scan",
+        Some(scheduled_scan.id),
+        json!({
+            "enabled": scheduled_scan.enabled,
+            "cadence": scan_cadence_slug(scheduled_scan.cadence),
+            "profile": scan_profile_slug(scheduled_scan.profile)
+        }),
+    )
+    .await?;
+
+    Ok(Json(ScheduledScanResponse { scheduled_scan }))
+}
+
+async fn pause_scheduled_scan(
+    State(pool): State<PgPool>,
+    headers: HeaderMap,
+    Path((organization_id, scheduled_scan_id)): Path<(Uuid, Uuid)>,
+) -> Result<Json<ScheduledScanResponse>, ApiError> {
+    let user_id = current_user_id(&headers)?;
+    let role = require_membership(&pool, user_id, organization_id).await?;
+    if matches!(role, MemberRole::Viewer) {
+        return Err(ApiError::forbidden("viewers cannot pause scan schedules"));
+    }
+    let row = sqlx::query(
+        r#"
+        UPDATE scheduled_scans
+        SET enabled = false, next_run_at = NULL, updated_at = now()
+        WHERE id = $1 AND organization_id = $2
+        RETURNING id, organization_id, asset_id, cadence::text AS cadence, profile::text AS profile,
+            enabled, next_run_at, last_enqueued_at, created_by, created_at, updated_at
+        "#,
+    )
+    .bind(scheduled_scan_id)
+    .bind(organization_id)
+    .fetch_optional(&pool)
+    .await
+    .map_err(map_sql_error)?
+    .ok_or_else(|| ApiError::not_found("scheduled scan does not exist"))?;
+    let scheduled_scan = scheduled_scan_from_row(&row);
+    record_audit(
+        &pool,
+        Some(organization_id),
+        Some(user_id),
+        "scheduled_scan.paused",
+        "scheduled_scan",
+        Some(scheduled_scan.id),
+        json!({}),
+    )
+    .await?;
+
+    Ok(Json(ScheduledScanResponse { scheduled_scan }))
+}
+
 async fn run_dns_baseline_scan(
     State(pool): State<PgPool>,
     headers: HeaderMap,
@@ -802,10 +1049,10 @@ async fn list_findings(
         r#"
         SELECT id, organization_id, asset_id, rule_id, title, severity::text AS severity,
             confidence::text AS confidence, status::text AS status, evidence, remediation,
-            first_seen_at, last_seen_at
+            occurrence_count, risk_score, risk_factors, first_seen_at, last_seen_at
         FROM findings
         WHERE organization_id = $1
-        ORDER BY last_seen_at DESC
+        ORDER BY risk_score DESC, last_seen_at DESC
         "#,
     )
     .bind(organization_id)
@@ -837,7 +1084,7 @@ async fn update_finding_status(
         WHERE id = $1 AND organization_id = $2
         RETURNING id, organization_id, asset_id, rule_id, title, severity::text AS severity,
             confidence::text AS confidence, status::text AS status, evidence, remediation,
-            first_seen_at, last_seen_at
+            occurrence_count, risk_score, risk_factors, first_seen_at, last_seen_at
         "#,
     )
     .bind(finding_id)
@@ -1054,7 +1301,7 @@ async fn list_alerts(
     let rows = sqlx::query(
         r#"
         SELECT id, organization_id, finding_id, notification_channel_id, status::text AS status,
-            payload, created_at, sent_at
+            payload, created_at, sent_at, attempts, next_attempt_at, error_message
         FROM alerts
         WHERE organization_id = $1
         ORDER BY created_at DESC
@@ -1079,6 +1326,7 @@ async fn deliver_alert(
         r#"
         SELECT alerts.id, alerts.organization_id, alerts.finding_id, alerts.notification_channel_id,
             alerts.status::text AS status, alerts.payload, alerts.created_at, alerts.sent_at,
+            alerts.attempts, alerts.next_attempt_at, alerts.error_message,
             notification_channels.secret_ref
         FROM alerts
         INNER JOIN notification_channels ON notification_channels.id = alerts.notification_channel_id
@@ -1399,14 +1647,17 @@ async fn upsert_findings(
 ) -> Result<Vec<Finding>, ApiError> {
     let mut findings = Vec::new();
     for draft in derive_findings_from_scan_result(scan_result) {
+        let risk_score = calculate_finding_risk_score(draft.severity, draft.confidence, 1, 0, true);
+        let risk_factors = finding_risk_factors(draft.severity, draft.confidence, 1, 0, true);
         let row = sqlx::query(
             r#"
             INSERT INTO findings (
                 id, organization_id, asset_id, rule_id, title, severity, confidence,
-                status, evidence, remediation, first_seen_at, last_seen_at
+                status, evidence, remediation, occurrence_count, risk_score, risk_factors,
+                first_seen_at, last_seen_at
             )
             VALUES ($1, $2, $3, $4, $5, $6::severity, $7::confidence, 'open',
-                $8, $9, now(), now())
+                $8, $9, 1, $10, $11, now(), now())
             ON CONFLICT (asset_id, rule_id)
             DO UPDATE SET
                 title = EXCLUDED.title,
@@ -1414,6 +1665,13 @@ async fn upsert_findings(
                 confidence = EXCLUDED.confidence,
                 evidence = EXCLUDED.evidence,
                 remediation = EXCLUDED.remediation,
+                occurrence_count = findings.occurrence_count + 1,
+                risk_score = LEAST(100, EXCLUDED.risk_score + LEAST(20, findings.occurrence_count * 4)),
+                risk_factors = jsonb_set(
+                    EXCLUDED.risk_factors,
+                    '{occurrence_count}',
+                    to_jsonb(findings.occurrence_count + 1)
+                ),
                 last_seen_at = now(),
                 status = CASE
                     WHEN findings.status = 'remediated' THEN 'reopened'::finding_status
@@ -1421,7 +1679,7 @@ async fn upsert_findings(
                 END
             RETURNING id, organization_id, asset_id, rule_id, title, severity::text AS severity,
                 confidence::text AS confidence, status::text AS status, evidence, remediation,
-                first_seen_at, last_seen_at
+                occurrence_count, risk_score, risk_factors, first_seen_at, last_seen_at
             "#,
         )
         .bind(Uuid::now_v7())
@@ -1433,6 +1691,8 @@ async fn upsert_findings(
         .bind(confidence_slug(draft.confidence))
         .bind(&draft.evidence)
         .bind(&draft.remediation)
+        .bind(risk_score)
+        .bind(risk_factors)
         .fetch_one(pool)
         .await
         .map_err(map_sql_error)?;
@@ -1482,7 +1742,7 @@ async fn insert_alert(
         INSERT INTO alerts (id, organization_id, finding_id, notification_channel_id, status, payload)
         VALUES ($1, $2, $3, $4, $5::alert_status, $6)
         RETURNING id, organization_id, finding_id, notification_channel_id, status::text AS status,
-            payload, created_at, sent_at
+            payload, created_at, sent_at, attempts, next_attempt_at, error_message
         "#,
     )
     .bind(Uuid::now_v7())
@@ -1506,10 +1766,10 @@ async fn update_alert_delivery(
     let row = sqlx::query(
         r#"
         UPDATE alerts
-        SET status = $2::alert_status, sent_at = $3
+        SET status = $2::alert_status, sent_at = $3, locked_at = NULL
         WHERE id = $1
         RETURNING id, organization_id, finding_id, notification_channel_id, status::text AS status,
-            payload, created_at, sent_at
+            payload, created_at, sent_at, attempts, next_attempt_at, error_message
         "#,
     )
     .bind(alert_id)
@@ -1612,7 +1872,7 @@ async fn require_finding_in_org(
         r#"
         SELECT id, organization_id, asset_id, rule_id, title, severity::text AS severity,
             confidence::text AS confidence, status::text AS status, evidence, remediation,
-            first_seen_at, last_seen_at
+            occurrence_count, risk_score, risk_factors, first_seen_at, last_seen_at
         FROM findings
         WHERE id = $1 AND organization_id = $2
         "#,
@@ -1716,7 +1976,9 @@ async fn active_alert_for_finding(
         SELECT id, organization_id, finding_id, notification_channel_id, status::text AS status,
             payload, created_at, sent_at
         FROM alerts
-        WHERE finding_id = $1 AND status IN ('queued', 'sent')
+        WHERE finding_id = $1
+          AND status IN ('queued', 'sent', 'suppressed')
+          AND created_at >= now() - interval '24 hours'
         ORDER BY created_at DESC
         LIMIT 1
         "#,
@@ -1835,6 +2097,22 @@ fn scan_job_from_row(row: &PgRow) -> ScanJob {
     }
 }
 
+fn scheduled_scan_from_row(row: &PgRow) -> ScheduledScan {
+    ScheduledScan {
+        id: row.get("id"),
+        organization_id: row.get("organization_id"),
+        asset_id: row.get("asset_id"),
+        cadence: parse_scan_cadence(row.get("cadence")),
+        profile: parse_scan_profile(row.get("profile")),
+        enabled: row.get("enabled"),
+        next_run_at: row.get("next_run_at"),
+        last_enqueued_at: row.get("last_enqueued_at"),
+        created_by: row.get("created_by"),
+        created_at: row.get("created_at"),
+        updated_at: row.get("updated_at"),
+    }
+}
+
 fn scan_result_from_row(row: &PgRow) -> Result<ScanResult, ApiError> {
     let evidence: Value = row.get("evidence");
     Ok(ScanResult {
@@ -1860,6 +2138,9 @@ fn finding_from_row(row: &PgRow) -> Finding {
         confidence: parse_confidence(row.get("confidence")),
         evidence: row.get("evidence"),
         remediation: row.get("remediation"),
+        occurrence_count: row.get("occurrence_count"),
+        risk_score: row.get("risk_score"),
+        risk_factors: row.get("risk_factors"),
         first_seen_at: row.get("first_seen_at"),
         last_seen_at: row.get("last_seen_at"),
     }
@@ -1903,6 +2184,9 @@ fn alert_from_row(row: &PgRow) -> Alert {
         payload,
         created_at: row.get("created_at"),
         sent_at: row.get("sent_at"),
+        attempts: row.get("attempts"),
+        next_attempt_at: row.get("next_attempt_at"),
+        error_message: row.get("error_message"),
     }
 }
 
@@ -2024,6 +2308,33 @@ fn validate_scan_reason(input: Option<String>) -> Result<Option<String>, ApiErro
     validate_optional_text(input, "scan reason", 240)
 }
 
+fn enforce_auth_rate_limit(key: &str) -> Result<(), ApiError> {
+    const WINDOW_SECONDS: i64 = 60;
+    const MAX_ATTEMPTS: usize = 12;
+
+    static ATTEMPTS: OnceLock<Mutex<HashMap<String, VecDeque<chrono::DateTime<Utc>>>>> =
+        OnceLock::new();
+
+    let now = Utc::now();
+    let attempts = ATTEMPTS.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut attempts = attempts.lock().map_err(|_| ApiError::internal())?;
+    let entries = attempts.entry(key.to_string()).or_default();
+    while let Some(oldest) = entries.front() {
+        if now.signed_duration_since(*oldest).num_seconds() > WINDOW_SECONDS {
+            entries.pop_front();
+        } else {
+            break;
+        }
+    }
+    if entries.len() >= MAX_ATTEMPTS {
+        return Err(ApiError::too_many_requests(
+            "too many authentication attempts; wait before retrying",
+        ));
+    }
+    entries.push_back(now);
+    Ok(())
+}
+
 fn session_for_user(user_id: Uuid) -> Result<SessionToken, ApiError> {
     const SESSION_TTL_SECONDS: i64 = 60 * 60 * 8;
     let access_token =
@@ -2093,6 +2404,50 @@ fn parse_scan_status(value: &str) -> ScanStatus {
         "failed" => ScanStatus::Failed,
         "canceled" => ScanStatus::Canceled,
         _ => ScanStatus::Failed,
+    }
+}
+
+fn scan_cadence_slug(cadence: ScanCadence) -> &'static str {
+    match cadence {
+        ScanCadence::Manual => "manual",
+        ScanCadence::Daily => "daily",
+        ScanCadence::Weekly => "weekly",
+    }
+}
+
+fn parse_scan_cadence(value: &str) -> ScanCadence {
+    match value {
+        "manual" => ScanCadence::Manual,
+        "daily" => ScanCadence::Daily,
+        "weekly" => ScanCadence::Weekly,
+        _ => ScanCadence::Manual,
+    }
+}
+
+fn scan_profile_slug(profile: ScanProfile) -> &'static str {
+    match profile {
+        ScanProfile::DnsBaseline => "dns_baseline",
+        ScanProfile::HttpProbe => "http_probe",
+        ScanProfile::DnsPolicy => "dns_policy",
+        ScanProfile::FullDomainBaseline => "full_domain_baseline",
+    }
+}
+
+fn parse_scan_profile(value: &str) -> ScanProfile {
+    match value {
+        "dns_baseline" => ScanProfile::DnsBaseline,
+        "http_probe" => ScanProfile::HttpProbe,
+        "dns_policy" => ScanProfile::DnsPolicy,
+        "full_domain_baseline" => ScanProfile::FullDomainBaseline,
+        _ => ScanProfile::DnsBaseline,
+    }
+}
+
+fn next_run_for_cadence(cadence: ScanCadence) -> Option<chrono::DateTime<Utc>> {
+    match cadence {
+        ScanCadence::Manual => None,
+        ScanCadence::Daily => Some(Utc::now() + Duration::days(1)),
+        ScanCadence::Weekly => Some(Utc::now() + Duration::weeks(1)),
     }
 }
 
@@ -2250,6 +2605,13 @@ impl ApiError {
         }
     }
 
+    fn too_many_requests(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::TOO_MANY_REQUESTS,
+            message: message.into(),
+        }
+    }
+
     fn bad_gateway(message: impl Into<String>) -> Self {
         Self {
             status: StatusCode::BAD_GATEWAY,
@@ -2323,6 +2685,12 @@ mod tests {
             validate_required_note(" accepted for launch week ").unwrap(),
             "accepted for launch week"
         );
+    }
+
+    #[test]
+    fn allows_auth_rate_limit_under_threshold() {
+        let key = format!("rate-{}", Uuid::now_v7());
+        assert!(enforce_auth_rate_limit(&key).is_ok());
     }
 
     #[test]

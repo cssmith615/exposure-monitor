@@ -76,6 +76,56 @@ pub struct CreateScanJobResponse {
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 #[serde(rename_all = "snake_case")]
+pub enum ScanCadence {
+    Manual,
+    Daily,
+    Weekly,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "snake_case")]
+pub enum ScanProfile {
+    DnsBaseline,
+    HttpProbe,
+    DnsPolicy,
+    FullDomainBaseline,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ScheduledScan {
+    pub id: Uuid,
+    pub organization_id: Uuid,
+    pub asset_id: Uuid,
+    pub cadence: ScanCadence,
+    pub profile: ScanProfile,
+    pub enabled: bool,
+    pub next_run_at: Option<DateTime<Utc>>,
+    pub last_enqueued_at: Option<DateTime<Utc>>,
+    pub created_by: Uuid,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CreateScheduledScanRequest {
+    pub cadence: ScanCadence,
+    pub profile: ScanProfile,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct UpdateScheduledScanRequest {
+    pub cadence: ScanCadence,
+    pub profile: ScanProfile,
+    pub enabled: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ScheduledScanResponse {
+    pub scheduled_scan: ScheduledScan,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "snake_case")]
 pub enum DnsAddressRecordKind {
     A,
     Aaaa,
@@ -321,6 +371,9 @@ pub struct Finding {
     pub confidence: Confidence,
     pub evidence: String,
     pub remediation: String,
+    pub occurrence_count: i32,
+    pub risk_score: i32,
+    pub risk_factors: Value,
     pub first_seen_at: DateTime<Utc>,
     pub last_seen_at: DateTime<Utc>,
 }
@@ -402,6 +455,9 @@ pub struct Alert {
     pub payload: String,
     pub created_at: DateTime<Utc>,
     pub sent_at: Option<DateTime<Utc>>,
+    pub attempts: i32,
+    pub next_attempt_at: Option<DateTime<Utc>>,
+    pub error_message: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -571,6 +627,56 @@ pub fn validate_slug(input: &str) -> Result<String, SlugValidationError> {
     Ok(slug)
 }
 
+pub fn calculate_finding_risk_score(
+    severity: Severity,
+    confidence: Confidence,
+    occurrence_count: i32,
+    age_days: i64,
+    publicly_exposed: bool,
+) -> i32 {
+    let severity_points = match severity {
+        Severity::Info => 5,
+        Severity::Low => 20,
+        Severity::Medium => 45,
+        Severity::High => 70,
+        Severity::Critical => 90,
+    };
+    let confidence_points = match confidence {
+        Confidence::Low => 0,
+        Confidence::Medium => 5,
+        Confidence::High => 10,
+    };
+    let exposure_points = if publicly_exposed { 10 } else { 0 };
+    let recurrence_points = occurrence_count.saturating_sub(1).min(5) * 4;
+    let age_points = if age_days >= 30 {
+        10
+    } else if age_days >= 7 {
+        5
+    } else {
+        0
+    };
+
+    (severity_points + confidence_points + exposure_points + recurrence_points + age_points)
+        .min(100)
+}
+
+pub fn finding_risk_factors(
+    severity: Severity,
+    confidence: Confidence,
+    occurrence_count: i32,
+    age_days: i64,
+    publicly_exposed: bool,
+) -> Value {
+    serde_json::json!({
+        "severity": severity,
+        "confidence": confidence,
+        "occurrence_count": occurrence_count,
+        "age_days": age_days,
+        "publicly_exposed": publicly_exposed,
+        "kev_relevance": "not_applicable_without_cve"
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -607,5 +713,14 @@ mod tests {
             validate_slug("acme--security").unwrap_err(),
             SlugValidationError::ConsecutiveHyphen
         );
+    }
+
+    #[test]
+    fn prioritizes_public_critical_findings() {
+        assert_eq!(
+            calculate_finding_risk_score(Severity::Critical, Confidence::High, 3, 30, true),
+            100
+        );
+        assert!(calculate_finding_risk_score(Severity::Low, Confidence::Low, 1, 0, true) < 40);
     }
 }

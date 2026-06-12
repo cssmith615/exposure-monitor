@@ -88,6 +88,9 @@ mod tests {
             confidence: Confidence::High,
             evidence: "Certificate expires in 12 days".to_string(),
             remediation: "Renew the certificate.".to_string(),
+            occurrence_count: 1,
+            risk_score: 90,
+            risk_factors: serde_json::json!({}),
             first_seen_at: chrono::Utc::now(),
             last_seen_at: chrono::Utc::now(),
         };

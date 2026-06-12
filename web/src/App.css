@@ -759,6 +759,60 @@ mark.completed {
   margin-top: 20px;
 }
 
+.detail-page {
+  margin-bottom: 20px;
+}
+
+.detail-grid {
+  display: grid;
+  gap: 16px;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+}
+
+.detail-block {
+  background: rgba(255, 255, 255, 0.04);
+  border: 1px solid rgba(124, 247, 212, 0.12);
+  border-radius: 8px;
+  color: #d6e8e3;
+  min-width: 0;
+  padding: 14px;
+}
+
+.detail-block span {
+  color: #849994;
+  display: block;
+  font-size: 12px;
+  font-weight: 700;
+  margin-bottom: 8px;
+  text-transform: uppercase;
+}
+
+.detail-block p {
+  border-top: 1px solid rgba(124, 247, 212, 0.1);
+  margin: 0;
+  padding: 9px 0;
+}
+
+.raw-json {
+  background: rgba(0, 0, 0, 0.28);
+  border: 1px solid rgba(124, 247, 212, 0.14);
+  border-radius: 8px;
+  color: #cffff0;
+  font-family: ui-monospace, "Cascadia Code", Consolas, monospace;
+  font-size: 12px;
+  line-height: 1.55;
+  margin: 0;
+  max-height: 360px;
+  overflow: auto;
+  padding: 14px;
+  white-space: pre-wrap;
+}
+
+.raw-json.compact {
+  max-height: 180px;
+  padding: 10px;
+}
+
 .activity-layout {
   display: grid;
   gap: 18px;
@@ -898,6 +952,7 @@ mark.completed {
 
   .metrics,
   .content-grid,
+  .detail-grid,
   .activity-layout,
   .ops-grid,
   .topbar,

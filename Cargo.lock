@@ -286,6 +286,7 @@ name = "ceem-worker"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "ceem-alerts",
  "ceem-db",
  "ceem-findings",
  "ceem-scanner",

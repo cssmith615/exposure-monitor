@@ -25,6 +25,7 @@ const sessionStorageKey = 'ceem.session'
 type SessionState = {
   user: UserAccount
   session: SessionToken
+  expires_at?: number
 }
 
 type SessionToken = {
@@ -117,6 +118,9 @@ type Finding = {
   confidence: 'low' | 'medium' | 'high'
   evidence: string
   remediation: string
+  occurrence_count: number
+  risk_score: number
+  risk_factors: Record<string, unknown>
   first_seen_at: string
   last_seen_at: string
 }
@@ -140,6 +144,26 @@ type Alert = {
   payload: string
   created_at: string
   sent_at: string | null
+  attempts: number
+  next_attempt_at: string | null
+  error_message: string | null
+}
+
+type ScanCadence = 'manual' | 'daily' | 'weekly'
+type ScanProfile = 'dns_baseline' | 'http_probe' | 'dns_policy' | 'full_domain_baseline'
+
+type ScheduledScan = {
+  id: string
+  organization_id: string
+  asset_id: string
+  cadence: ScanCadence
+  profile: ScanProfile
+  enabled: boolean
+  next_run_at: string | null
+  last_enqueued_at: string | null
+  created_by: string
+  created_at: string
+  updated_at: string
 }
 
 type RemediationTask = {
@@ -170,6 +194,7 @@ type WorkspaceData = {
   scanResults: ScanResult[]
   findings: Finding[]
   alerts: Alert[]
+  scheduledScans: ScheduledScan[]
   remediationTasks: RemediationTask[]
   auditLogs: AuditLog[]
   members: OrganizationMember[]
@@ -181,6 +206,7 @@ const emptyWorkspace: WorkspaceData = {
   scanResults: [],
   findings: [],
   alerts: [],
+  scheduledScans: [],
   remediationTasks: [],
   auditLogs: [],
   members: [],
@@ -203,6 +229,8 @@ function App() {
   const [slackName, setSlackName] = useState('#security-alerts')
   const [slackWebhookUrl, setSlackWebhookUrl] = useState('')
   const [activeFindingId, setActiveFindingId] = useState<string>('')
+  const [activeAssetId, setActiveAssetId] = useState<string>('')
+  const [activeScanResultId, setActiveScanResultId] = useState<string>('')
   const [findingEvents, setFindingEvents] = useState<FindingEvent[]>([])
   const [noteDraft, setNoteDraft] = useState('Accepted through launch week; revisit after automation lands.')
   const [isLoading, setIsLoading] = useState(false)
@@ -212,12 +240,25 @@ function App() {
     (summary) => summary.organization.id === activeOrganizationId,
   )?.organization
   const activeFinding = workspace.findings.find((finding) => finding.id === activeFindingId)
+  const activeAsset = workspace.assets.find((asset) => asset.id === activeAssetId) ?? workspace.assets[0]
+  const activeScanResult =
+    workspace.scanResults.find((scanResult) => scanResult.id === activeScanResultId) ??
+    workspace.scanResults[0]
   const activeAssetById = useMemo(
     () => new Map(workspace.assets.map((asset) => [asset.id, asset])),
     [workspace.assets],
   )
   const latestScanTarget = workspace.assets[0]
   const openFindings = workspace.findings.filter((finding) => finding.status !== 'remediated')
+  const needsAttentionFindings = useMemo(
+    () =>
+      [...workspace.findings].sort(
+        (left, right) =>
+          right.risk_score - left.risk_score ||
+          new Date(right.last_seen_at).getTime() - new Date(left.last_seen_at).getTime(),
+      ),
+    [workspace.findings],
+  )
   const highFindings = workspace.findings.filter(
     (finding) => finding.severity === 'high' || finding.severity === 'critical',
   )
@@ -235,6 +276,9 @@ function App() {
       const body = await response.text()
       const parsed = body ? JSON.parse(body) : null
       if (!response.ok) {
+        if (response.status === 401) {
+          clearSession()
+        }
         throw new Error(parsed?.error ?? `Request failed with ${response.status}`)
       }
       return parsed as T
@@ -266,6 +310,7 @@ function App() {
         scanResults,
         findings,
         alerts,
+        scheduledScans,
         remediationTasks,
         auditLogs,
         members,
@@ -275,12 +320,15 @@ function App() {
         api<ScanResult[]>(`/v1/organizations/${activeOrganizationId}/scan-results`),
         api<Finding[]>(`/v1/organizations/${activeOrganizationId}/findings`),
         api<Alert[]>(`/v1/organizations/${activeOrganizationId}/alerts`),
+        api<ScheduledScan[]>(`/v1/organizations/${activeOrganizationId}/scheduled-scans`),
         api<RemediationTask[]>(`/v1/organizations/${activeOrganizationId}/remediation-tasks`),
         api<AuditLog[]>(`/v1/organizations/${activeOrganizationId}/audit-logs`),
         api<OrganizationMember[]>(`/v1/organizations/${activeOrganizationId}/members`),
       ])
-      setWorkspace({ assets, scanJobs, scanResults, findings, alerts, remediationTasks, auditLogs, members })
+      setWorkspace({ assets, scanJobs, scanResults, findings, alerts, scheduledScans, remediationTasks, auditLogs, members })
       setActiveFindingId((current) => current || findings[0]?.id || '')
+      setActiveAssetId((current) => current || assets[0]?.id || '')
+      setActiveScanResultId((current) => current || scanResults[0]?.id || '')
     } catch (caught) {
       setError(errorMessage(caught))
     } finally {
@@ -325,8 +373,12 @@ function App() {
                 password: authPassword,
               }),
             })
-      localStorage.setItem(sessionStorageKey, JSON.stringify(nextSession))
-      setSession(nextSession)
+      const enrichedSession = {
+        ...nextSession,
+        expires_at: Date.now() + nextSession.session.expires_in_seconds * 1000,
+      }
+      localStorage.setItem(sessionStorageKey, JSON.stringify(enrichedSession))
+      setSession(enrichedSession)
     } catch (caught) {
       setError(errorMessage(caught))
     } finally {
@@ -366,6 +418,25 @@ function App() {
       await api(`/v1/organizations/${activeOrganizationId}/domain-assets/${assetId}/scan-jobs`, {
         method: 'POST',
         body: JSON.stringify({ reason }),
+      })
+      await refreshWorkspace()
+    })
+  }
+
+  async function saveSchedule(assetId: string, cadence: ScanCadence, profile: ScanProfile) {
+    await mutate(async () => {
+      await api(`/v1/organizations/${activeOrganizationId}/domain-assets/${assetId}/scheduled-scans`, {
+        method: 'POST',
+        body: JSON.stringify({ cadence, profile }),
+      })
+      await refreshWorkspace()
+    })
+  }
+
+  async function pauseSchedule(scheduleId: string) {
+    await mutate(async () => {
+      await api(`/v1/organizations/${activeOrganizationId}/scheduled-scans/${scheduleId}/pause`, {
+        method: 'POST',
       })
       await refreshWorkspace()
     })
@@ -487,6 +558,10 @@ function App() {
   }
 
   function logout() {
+    clearSession()
+  }
+
+  function clearSession() {
     localStorage.removeItem(sessionStorageKey)
     setSession(null)
     setOrganizations([])
@@ -664,7 +739,7 @@ function App() {
           <div className="stage-copy">
             <p className="eyebrow">Continuous external exposure monitor</p>
             <h2>
-              {workspace.assets.length} domains watched. {highFindings.length} priority findings open.
+              {workspace.assets.length} domains watched. {needsAttentionFindings[0]?.risk_score ?? 0} top risk score.
             </h2>
             <div className="stage-actions">
               <button disabled={!latestScanTarget} type="button" onClick={() => latestScanTarget && queueScan(latestScanTarget.id)}>
@@ -691,7 +766,7 @@ function App() {
           <article><span>Domains</span><strong>{workspace.assets.length}</strong><small>Authorized assets</small></article>
           <article><span>Open findings</span><strong>{openFindings.length}</strong><small>{highFindings.length} high or critical</small></article>
           <article><span>Last scan</span><strong>{workspace.scanResults[0] ? formatTime(workspace.scanResults[0].observed_at) : 'None'}</strong><small>Evidence capture</small></article>
-          <article><span>Slack alerts</span><strong>{workspace.alerts.length}</strong><small>Queued, sent, failed, suppressed</small></article>
+          <article><span>Schedules</span><strong>{workspace.scheduledScans.filter((schedule) => schedule.enabled).length}</strong><small>Active cadence policies</small></article>
         </section>
 
         <section className="content-grid">
@@ -721,8 +796,12 @@ function App() {
             {workspace.assets.map((asset) => (
               <div className="scan-row" key={asset.id}>
                 <CheckCircle2 size={18} aria-hidden="true" />
-                <span><strong>{asset.domain}</strong><small>Added {formatTime(asset.created_at)}</small></span>
-                <button className="secondary" type="button" onClick={() => queueScan(asset.id)}>Scan</button>
+                <span><strong>{asset.domain}</strong><small>{scheduleLabel(workspace.scheduledScans, asset.id)}</small></span>
+                <span className="row-actions">
+                  <button className="secondary" type="button" onClick={() => setActiveAssetId(asset.id)}>Details</button>
+                  <button className="secondary" type="button" onClick={() => queueScan(asset.id)}>Scan</button>
+                  <button type="button" onClick={() => saveSchedule(asset.id, 'daily', 'full_domain_baseline')}>Daily full</button>
+                </span>
               </div>
             ))}
             {workspace.assets.length === 0 && <p className="empty-state">No authorized domains yet.</p>}
@@ -767,6 +846,43 @@ function App() {
           </div>
         </section>
 
+        {activeAsset && (
+          <section className="panel detail-page" aria-label="Asset detail">
+            <div className="panel-header">
+              <div><p className="eyebrow">Asset detail</p><h2>{activeAsset.domain}</h2></div>
+              <div className="row-actions">
+                <button className="secondary" type="button" onClick={() => saveSchedule(activeAsset.id, 'weekly', 'full_domain_baseline')}>Weekly full</button>
+                {workspace.scheduledScans
+                  .filter((schedule) => schedule.asset_id === activeAsset.id && schedule.enabled)
+                  .slice(0, 1)
+                  .map((schedule) => (
+                    <button className="secondary" key={schedule.id} type="button" onClick={() => pauseSchedule(schedule.id)}>Pause</button>
+                  ))}
+              </div>
+            </div>
+            <div className="detail-grid">
+              <div className="detail-block">
+                <span>Schedules</span>
+                {workspace.scheduledScans.filter((schedule) => schedule.asset_id === activeAsset.id).map((schedule) => (
+                  <p key={schedule.id}>{schedule.profile.replaceAll('_', ' ')} / {schedule.cadence} / {schedule.enabled ? 'enabled' : 'paused'}</p>
+                ))}
+              </div>
+              <div className="detail-block">
+                <span>Recent scans</span>
+                {workspace.scanJobs.filter((job) => job.asset_id === activeAsset.id).slice(0, 4).map((job) => (
+                  <p key={job.id}>{job.status} / {formatTime(job.created_at)} / {job.reason ?? 'Manual scan'}</p>
+                ))}
+              </div>
+              <div className="detail-block">
+                <span>Findings</span>
+                {workspace.findings.filter((finding) => finding.asset_id === activeAsset.id).slice(0, 4).map((finding) => (
+                  <p key={finding.id}>{finding.risk_score} / {finding.title}</p>
+                ))}
+              </div>
+            </div>
+          </section>
+        )}
+
         <section className="panel evidence-vault" aria-label="Scan evidence">
           <div className="panel-header">
             <div><p className="eyebrow">Evidence vault</p><h2>Scan history</h2></div>
@@ -778,23 +894,36 @@ function App() {
                 <span className="job-id">{shortId(item.id)}</span>
                 <span><strong>{activeAssetById.get(item.asset_id)?.domain ?? evidenceDomain(item.evidence)}</strong><small>{item.source}</small></span>
                 <span className="address-stack">{evidenceSummary(item.evidence)}</span>
-                <span>{formatTime(item.observed_at)}</span>
+                <span className="row-actions">
+                  <button className="secondary" type="button" onClick={() => setActiveScanResultId(item.id)}>Raw</button>
+                  <span>{formatTime(item.observed_at)}</span>
+                </span>
               </div>
             ))}
           </div>
         </section>
+
+        {activeScanResult && (
+          <section className="panel detail-page" aria-label="Scan result detail">
+            <div className="panel-header">
+              <div><p className="eyebrow">Scan result detail</p><h2>{activeScanResult.source.replaceAll('_', ' ')}</h2></div>
+              <mark className="completed">{formatTime(activeScanResult.observed_at)}</mark>
+            </div>
+            <pre className="raw-json">{JSON.stringify(activeScanResult.evidence, null, 2)}</pre>
+          </section>
+        )}
 
         <section className="panel findings" id="findings">
           <div className="panel-header">
             <div><p className="eyebrow">Remediation workflow</p><h2>Current findings</h2></div>
           </div>
           <div className="finding-table">
-            <div className="table-head"><span>Asset</span><span>Finding</span><span>Severity</span><span>Status</span><span>Confidence</span><span>Actions</span></div>
-            {workspace.findings.map((finding) => (
+            <div className="table-head"><span>Asset</span><span>Finding</span><span>Risk</span><span>Status</span><span>Confidence</span><span>Actions</span></div>
+            {needsAttentionFindings.map((finding) => (
               <div className="table-row" key={finding.id}>
                 <span>{activeAssetById.get(finding.asset_id)?.domain ?? finding.asset_id}</span>
                 <span>{finding.title}</span>
-                <span><mark className={finding.severity}>{finding.severity}</mark></span>
+                <span><mark className={finding.severity}>{finding.risk_score}</mark></span>
                 <span>{finding.status.replaceAll('_', ' ')}</span>
                 <span>{finding.confidence}</span>
                 <span className="row-actions">
@@ -816,8 +945,9 @@ function App() {
             <div className="activity-layout">
               <div className="activity-summary">
                 <span>{activeAssetById.get(activeFinding.asset_id)?.domain}</span>
-                <strong>{activeFinding.status.replaceAll('_', ' ')}</strong>
+                <strong>{activeFinding.risk_score} risk / {activeFinding.status.replaceAll('_', ' ')}</strong>
                 <small>{activeFinding.remediation}</small>
+                <small>Seen {activeFinding.occurrence_count} times / {activeFinding.evidence}</small>
                 <div className="status-actions">
                   <button className="secondary" type="button" onClick={() => updateFindingStatus('in_progress')}>In progress</button>
                   <button className="secondary" type="button" onClick={() => updateFindingStatus('accepted_risk')}>Accepted risk</button>
@@ -840,6 +970,24 @@ function App() {
                 ))}
               </div>
             </div>
+            <div className="detail-grid">
+              <div className="detail-block">
+                <span>Slack alerts</span>
+                {workspace.alerts.filter((alert) => alert.finding_id === activeFinding.id).map((alert) => (
+                  <p key={alert.id}>{alert.status} / attempts {alert.attempts} / {alert.error_message ?? 'no error'}</p>
+                ))}
+              </div>
+              <div className="detail-block">
+                <span>Tasks</span>
+                {workspace.remediationTasks.filter((task) => task.finding_id === activeFinding.id).map((task) => (
+                  <p key={task.id}>{task.status.replaceAll('_', ' ')} / {task.title}</p>
+                ))}
+              </div>
+              <div className="detail-block">
+                <span>Risk factors</span>
+                <pre className="raw-json compact">{JSON.stringify(activeFinding.risk_factors, null, 2)}</pre>
+              </div>
+            </div>
           </section>
         )}
 
@@ -850,7 +998,7 @@ function App() {
               {workspace.alerts.map((alert) => (
                 <div className="compact-row" key={alert.id}>
                   <span className="job-id">{shortId(alert.id)}</span>
-                  <span><strong>{workspace.findings.find((finding) => finding.id === alert.finding_id)?.title ?? alert.finding_id}</strong><small>{alert.payload}</small></span>
+                  <span><strong>{workspace.findings.find((finding) => finding.id === alert.finding_id)?.title ?? alert.finding_id}</strong><small>{alert.payload}</small><small>Attempts {alert.attempts}{alert.next_attempt_at ? ` / retry ${formatTime(alert.next_attempt_at)}` : ''}</small></span>
                   <mark className={alert.status}>{alert.status}</mark>
                 </div>
               ))}
@@ -913,7 +1061,12 @@ function loadStoredSession(): SessionState | null {
     return null
   }
   try {
-    return JSON.parse(stored) as SessionState
+    const parsed = JSON.parse(stored) as SessionState
+    if (parsed.expires_at && Date.now() >= parsed.expires_at) {
+      localStorage.removeItem(sessionStorageKey)
+      return null
+    }
+    return parsed
   } catch {
     localStorage.removeItem(sessionStorageKey)
     return null
@@ -954,6 +1107,15 @@ function evidenceSummary(evidence: ScanEvidence) {
       <code>{evidence.data.final_url ?? evidence.data.error ?? 'no final URL'}</code>
     </>
   )
+}
+
+function scheduleLabel(schedules: ScheduledScan[], assetId: string) {
+  const active = schedules.find((schedule) => schedule.asset_id === assetId && schedule.enabled)
+  if (!active) {
+    return 'No active schedule'
+  }
+  const next = active.next_run_at ? formatTime(active.next_run_at) : 'manual only'
+  return `${active.cadence} / ${active.profile.replaceAll('_', ' ')} / next ${next}`
 }
 
 export default App

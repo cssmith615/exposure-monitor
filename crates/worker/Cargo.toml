@@ -8,6 +8,7 @@ rust-version.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+ceem-alerts = { path = "../alerts" }
 ceem-db = { path = "../db" }
 ceem-findings = { path = "../findings" }
 ceem-scanner = { path = "../scanner" }
