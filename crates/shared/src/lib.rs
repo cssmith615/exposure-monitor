@@ -1,5 +1,6 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use thiserror::Error;
 use uuid::Uuid;
 
@@ -450,6 +451,18 @@ pub struct UpdateRemediationStatusRequest {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct UpdateRemediationStatusResponse {
     pub task: RemediationTask,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct AuditLog {
+    pub id: Uuid,
+    pub organization_id: Option<Uuid>,
+    pub actor_user_id: Option<Uuid>,
+    pub action: String,
+    pub target_type: String,
+    pub target_id: Option<Uuid>,
+    pub metadata: Value,
+    pub created_at: DateTime<Utc>,
 }
 
 #[derive(Debug, Error, Clone, PartialEq, Eq)]

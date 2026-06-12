@@ -10,7 +10,7 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{get, post},
 };
-use ceem_alerts::build_slack_finding_alert;
+use ceem_alerts::{build_slack_finding_alert, deliver_slack_message};
 use ceem_auth::{
     PasswordPolicy, hash_password, issue_session_token, validate_password_policy, verify_password,
     verify_session_token,
@@ -18,7 +18,7 @@ use ceem_auth::{
 use ceem_findings::derive_findings_from_scan_result;
 use ceem_scanner::{collect_dns_policy_baseline, probe_http_endpoint, resolve_dns_baseline};
 use ceem_shared::{
-    AcceptOrganizationInviteResponse, Alert, AlertStatus, CreateDomainAssetRequest,
+    AcceptOrganizationInviteResponse, Alert, AlertStatus, AuditLog, CreateDomainAssetRequest,
     CreateDomainAssetResponse, CreateFindingNoteRequest, CreateFindingNoteResponse,
     CreateOrganizationInviteRequest, CreateOrganizationInviteResponse, CreateOrganizationRequest,
     CreateOrganizationResponse, CreateRemediationTaskRequest, CreateRemediationTaskResponse,
@@ -35,6 +35,7 @@ use ceem_shared::{
 };
 use chrono::Utc;
 use serde::Serialize;
+use serde_json::{Value, json};
 use tower_http::{cors::CorsLayer, trace::TraceLayer};
 use tracing::info;
 use tracing_subscriber::{EnvFilter, fmt};
@@ -137,6 +138,10 @@ fn app() -> Router {
             get(list_alerts),
         )
         .route(
+            "/v1/organizations/{organization_id}/alerts/{alert_id}/deliver",
+            post(deliver_alert),
+        )
+        .route(
             "/v1/organizations/{organization_id}/findings/{finding_id}/remediation-tasks",
             post(create_remediation_task),
         )
@@ -147,6 +152,10 @@ fn app() -> Router {
         .route(
             "/v1/organizations/{organization_id}/remediation-tasks/{task_id}/status",
             post(update_remediation_status),
+        )
+        .route(
+            "/v1/organizations/{organization_id}/audit-logs",
+            get(list_audit_logs),
         )
         .with_state(state)
         .layer(CorsLayer::permissive())
@@ -197,6 +206,7 @@ struct InMemoryRepository {
     slack_secret_refs_by_id: HashMap<Uuid, String>,
     alerts_by_id: HashMap<Uuid, Alert>,
     remediation_tasks_by_id: HashMap<Uuid, RemediationTask>,
+    audit_logs_by_id: HashMap<Uuid, AuditLog>,
 }
 
 async fn register_user(
@@ -551,6 +561,15 @@ async fn create_domain_asset(
     repository
         .domain_assets_by_id
         .insert(asset.id, asset.clone());
+    record_audit(
+        &mut repository,
+        Some(organization_id),
+        Some(user_id),
+        "domain.added",
+        "domain_asset",
+        Some(asset.id),
+        json!({ "domain": asset.domain.clone() }),
+    );
 
     Ok(Json(CreateDomainAssetResponse { asset }))
 }
@@ -619,6 +638,15 @@ async fn create_scan_job(
     repository
         .scan_jobs_by_id
         .insert(scan_job.id, scan_job.clone());
+    record_audit(
+        &mut repository,
+        Some(organization_id),
+        Some(user_id),
+        "scan.queued",
+        "scan_job",
+        Some(scan_job.id),
+        json!({ "asset_id": asset_id, "reason": scan_job.reason.clone() }),
+    );
 
     Ok(Json(CreateScanJobResponse { scan_job }))
 }
@@ -701,9 +729,20 @@ fn complete_scan_job_with_result(
     scan_job.completed_at = Some(completed_at);
     let scan_job = scan_job.clone();
 
+    let scan_result_id = scan_result.id;
+    let scan_result_source = scan_result.source.clone();
     repository
         .scan_results_by_id
         .insert(scan_result.id, scan_result);
+    record_audit(
+        &mut repository,
+        Some(scan_job.organization_id),
+        None,
+        "scan.completed",
+        "scan_job",
+        Some(scan_job.id),
+        json!({ "scan_result_id": scan_result_id, "source": scan_result_source }),
+    );
 
     Ok(scan_job)
 }
@@ -1015,6 +1054,15 @@ async fn update_finding_status(
             .insert(event.id, event.clone());
         event
     });
+    record_audit(
+        &mut repository,
+        Some(organization_id),
+        Some(user_id),
+        "finding.status_changed",
+        "finding",
+        Some(finding_id),
+        json!({ "status": finding_status_slug(request.status), "event_id": event.as_ref().map(|event| event.id) }),
+    );
 
     Ok(Json(UpdateFindingStatusResponse { finding, event }))
 }
@@ -1054,6 +1102,15 @@ async fn create_finding_note(
     repository
         .finding_events_by_id
         .insert(event.id, event.clone());
+    record_audit(
+        &mut repository,
+        Some(organization_id),
+        Some(user_id),
+        "finding.note_added",
+        "finding",
+        Some(finding_id),
+        json!({ "event_id": event.id }),
+    );
 
     Ok(Json(CreateFindingNoteResponse { event }))
 }
@@ -1154,6 +1211,35 @@ async fn queue_slack_alert(
         .cloned()
         .ok_or_else(|| ApiError::conflict("no enabled Slack channel is configured"))?;
 
+    if repository.alerts_by_id.values().any(|alert| {
+        alert.organization_id == organization_id
+            && alert.finding_id == finding_id
+            && matches!(alert.status, AlertStatus::Queued | AlertStatus::Sent)
+    }) {
+        let alert = Alert {
+            id: Uuid::now_v7(),
+            organization_id,
+            finding_id,
+            notification_channel_id: channel.id,
+            status: AlertStatus::Suppressed,
+            payload: "duplicate alert suppressed by noise budget".to_string(),
+            created_at: Utc::now(),
+            sent_at: None,
+        };
+        repository.alerts_by_id.insert(alert.id, alert.clone());
+        record_audit(
+            &mut repository,
+            Some(organization_id),
+            Some(user_id),
+            "alert.suppressed",
+            "finding",
+            Some(finding_id),
+            json!({ "reason": "duplicate_active_alert" }),
+        );
+
+        return Ok(Json(QueueSlackAlertResponse { alert }));
+    }
+
     let asset_domain = repository
         .domain_assets_by_id
         .get(&finding.asset_id)
@@ -1173,6 +1259,15 @@ async fn queue_slack_alert(
     };
 
     repository.alerts_by_id.insert(alert.id, alert.clone());
+    record_audit(
+        &mut repository,
+        Some(organization_id),
+        Some(user_id),
+        "alert.queued",
+        "finding",
+        Some(finding_id),
+        json!({ "channel_id": channel.id }),
+    );
 
     Ok(Json(QueueSlackAlertResponse { alert }))
 }
@@ -1196,6 +1291,94 @@ async fn list_alerts(
     alerts.sort_by(|left, right| right.created_at.cmp(&left.created_at));
 
     Ok(Json(alerts))
+}
+
+async fn deliver_alert(
+    State(repository): State<Arc<Mutex<InMemoryRepository>>>,
+    headers: HeaderMap,
+    Path((organization_id, alert_id)): Path<(Uuid, Uuid)>,
+) -> Result<Json<QueueSlackAlertResponse>, ApiError> {
+    let user_id = current_user_id(&headers)?;
+    let (webhook_url, message, alert) = {
+        let mut repository = repository.lock().map_err(|_| ApiError::internal())?;
+        repository.require_membership(user_id, organization_id)?;
+        let alert = repository
+            .alerts_by_id
+            .get(&alert_id)
+            .ok_or_else(|| ApiError::not_found("alert does not exist"))?
+            .clone();
+
+        if alert.organization_id != organization_id {
+            return Err(ApiError::not_found(
+                "alert does not belong to this organization",
+            ));
+        }
+
+        if alert.status != AlertStatus::Queued {
+            return Err(ApiError::conflict("only queued alerts can be delivered"));
+        }
+
+        let webhook_url = repository
+            .slack_secret_refs_by_id
+            .get(&alert.notification_channel_id)
+            .cloned()
+            .ok_or_else(|| ApiError::conflict("alert channel has no webhook secret"))?;
+        let message = ceem_alerts::SlackMessage {
+            text: alert.payload.clone(),
+        };
+        record_audit(
+            &mut repository,
+            Some(organization_id),
+            Some(user_id),
+            "alert.delivery_started",
+            "alert",
+            Some(alert_id),
+            json!({}),
+        );
+
+        (webhook_url, message, alert)
+    };
+
+    let delivered = deliver_slack_message(&webhook_url, &message).await;
+    let mut repository = repository.lock().map_err(|_| ApiError::internal())?;
+    let alert = repository
+        .alerts_by_id
+        .get_mut(&alert.id)
+        .ok_or_else(|| ApiError::not_found("alert does not exist"))?;
+
+    match delivered {
+        Ok(result) => {
+            alert.status = AlertStatus::Sent;
+            alert.sent_at = Some(Utc::now());
+            let alert = alert.clone();
+            record_audit(
+                &mut repository,
+                Some(organization_id),
+                Some(user_id),
+                "alert.sent",
+                "alert",
+                Some(alert_id),
+                json!({ "status_code": result.status_code }),
+            );
+
+            Ok(Json(QueueSlackAlertResponse { alert }))
+        }
+        Err(error) => {
+            alert.status = AlertStatus::Failed;
+            let alert = alert.clone();
+            record_audit(
+                &mut repository,
+                Some(organization_id),
+                Some(user_id),
+                "alert.failed",
+                "alert",
+                Some(alert_id),
+                json!({ "error": error.to_string() }),
+            );
+
+            Ok(Json(QueueSlackAlertResponse { alert }))
+        }
+    }
 }
 
 async fn create_remediation_task(
@@ -1241,6 +1424,15 @@ async fn create_remediation_task(
     repository
         .remediation_tasks_by_id
         .insert(task.id, task.clone());
+    record_audit(
+        &mut repository,
+        Some(organization_id),
+        Some(user_id),
+        "remediation.created",
+        "remediation_task",
+        Some(task.id),
+        json!({ "finding_id": finding_id }),
+    );
 
     Ok(Json(CreateRemediationTaskResponse { task }))
 }
@@ -1302,8 +1494,38 @@ async fn update_remediation_status(
             RemediationStatus::FalsePositive => FindingStatus::FalsePositive,
         };
     }
+    record_audit(
+        &mut repository,
+        Some(organization_id),
+        Some(user_id),
+        "remediation.status_changed",
+        "remediation_task",
+        Some(task_id),
+        json!({ "status": remediation_status_slug(request.status), "finding_id": finding_id }),
+    );
 
     Ok(Json(UpdateRemediationStatusResponse { task }))
+}
+
+async fn list_audit_logs(
+    State(repository): State<Arc<Mutex<InMemoryRepository>>>,
+    headers: HeaderMap,
+    Path(organization_id): Path<Uuid>,
+) -> Result<Json<Vec<AuditLog>>, ApiError> {
+    let user_id = current_user_id(&headers)?;
+    let repository = repository.lock().map_err(|_| ApiError::internal())?;
+    repository.require_membership(user_id, organization_id)?;
+
+    let mut logs = repository
+        .audit_logs_by_id
+        .values()
+        .filter(|log| log.organization_id == Some(organization_id))
+        .cloned()
+        .collect::<Vec<_>>();
+
+    logs.sort_by(|left, right| right.created_at.cmp(&left.created_at));
+
+    Ok(Json(logs))
 }
 
 fn normalize_email(input: &str) -> Result<String, ApiError> {
@@ -1420,6 +1642,40 @@ fn finding_status_slug(status: FindingStatus) -> &'static str {
         FindingStatus::Remediated => "remediated",
         FindingStatus::Reopened => "reopened",
     }
+}
+
+fn remediation_status_slug(status: RemediationStatus) -> &'static str {
+    match status {
+        RemediationStatus::Open => "open",
+        RemediationStatus::InProgress => "in_progress",
+        RemediationStatus::Blocked => "blocked",
+        RemediationStatus::Remediated => "remediated",
+        RemediationStatus::AcceptedRisk => "accepted_risk",
+        RemediationStatus::FalsePositive => "false_positive",
+    }
+}
+
+fn record_audit(
+    repository: &mut InMemoryRepository,
+    organization_id: Option<Uuid>,
+    actor_user_id: Option<Uuid>,
+    action: &str,
+    target_type: &str,
+    target_id: Option<Uuid>,
+    metadata: Value,
+) {
+    let log = AuditLog {
+        id: Uuid::now_v7(),
+        organization_id,
+        actor_user_id,
+        action: action.to_string(),
+        target_type: target_type.to_string(),
+        target_id,
+        metadata,
+        created_at: Utc::now(),
+    };
+
+    repository.audit_logs_by_id.insert(log.id, log);
 }
 
 fn validate_scan_reason(input: Option<String>) -> Result<Option<String>, ApiError> {
