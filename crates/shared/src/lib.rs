@@ -93,9 +93,44 @@ pub struct DnsBaselineEvidence {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SecurityHeaderObservation {
+    pub name: String,
+    pub value: Option<String>,
+    pub present: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TlsObservation {
+    pub negotiated_https: bool,
+    pub certificate_not_after: Option<DateTime<Utc>>,
+    pub issuer: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct HttpProbeEvidence {
+    pub domain: String,
+    pub scheme: String,
+    pub status_code: Option<u16>,
+    pub final_url: Option<String>,
+    pub redirect_chain: Vec<String>,
+    pub security_headers: Vec<SecurityHeaderObservation>,
+    pub tls: Option<TlsObservation>,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DnsPolicyEvidence {
+    pub domain: String,
+    pub spf_record: Option<String>,
+    pub dmarc_record: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "kind", content = "data", rename_all = "snake_case")]
 pub enum ScanEvidence {
     DnsBaseline(DnsBaselineEvidence),
+    HttpProbe(HttpProbeEvidence),
+    DnsPolicy(DnsPolicyEvidence),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

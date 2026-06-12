@@ -9,6 +9,8 @@ rust-version.workspace = true
 [dependencies]
 chrono.workspace = true
 ceem-shared = { path = "../shared" }
+reqwest.workspace = true
 serde.workspace = true
+serde_json.workspace = true
 thiserror.workspace = true
 tokio.workspace = true

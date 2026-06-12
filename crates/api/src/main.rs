@@ -16,7 +16,7 @@ use ceem_auth::{
     verify_session_token,
 };
 use ceem_findings::derive_findings_from_scan_result;
-use ceem_scanner::resolve_dns_baseline;
+use ceem_scanner::{collect_dns_policy_baseline, probe_http_endpoint, resolve_dns_baseline};
 use ceem_shared::{
     AcceptOrganizationInviteResponse, Alert, AlertStatus, CreateDomainAssetRequest,
     CreateDomainAssetResponse, CreateFindingNoteRequest, CreateFindingNoteResponse,
@@ -95,6 +95,14 @@ fn app() -> Router {
         .route(
             "/v1/organizations/{organization_id}/scan-jobs/{scan_job_id}/run-dns-baseline",
             post(run_dns_baseline_scan),
+        )
+        .route(
+            "/v1/organizations/{organization_id}/scan-jobs/{scan_job_id}/run-http-probe",
+            post(run_http_probe_scan),
+        )
+        .route(
+            "/v1/organizations/{organization_id}/scan-jobs/{scan_job_id}/run-dns-policy",
+            post(run_dns_policy_scan),
         )
         .route(
             "/v1/organizations/{organization_id}/scan-results",
@@ -636,6 +644,70 @@ async fn list_scan_jobs(
     Ok(Json(scan_jobs))
 }
 
+fn claim_scan_job_asset(
+    repository: &Arc<Mutex<InMemoryRepository>>,
+    user_id: Uuid,
+    organization_id: Uuid,
+    scan_job_id: Uuid,
+) -> Result<(Uuid, String), ApiError> {
+    let mut repository = repository.lock().map_err(|_| ApiError::internal())?;
+    let role = repository.require_membership(user_id, organization_id)?;
+
+    if matches!(role, MemberRole::Viewer) {
+        return Err(ApiError::forbidden("viewers cannot run scan jobs"));
+    }
+
+    let scan_job_asset_id = {
+        let scan_job = repository
+            .scan_jobs_by_id
+            .get_mut(&scan_job_id)
+            .ok_or_else(|| ApiError::not_found("scan job does not exist"))?;
+
+        if scan_job.organization_id != organization_id {
+            return Err(ApiError::not_found(
+                "scan job does not belong to this organization",
+            ));
+        }
+
+        if scan_job.status != ScanStatus::Queued {
+            return Err(ApiError::conflict("only queued scan jobs can be run"));
+        }
+
+        scan_job.status = ScanStatus::Running;
+        scan_job.started_at = Some(Utc::now());
+        scan_job.asset_id
+    };
+
+    let asset = repository
+        .domain_assets_by_id
+        .get(&scan_job_asset_id)
+        .ok_or_else(|| ApiError::not_found("domain asset does not exist"))?;
+
+    Ok((asset.id, asset.domain.clone()))
+}
+
+fn complete_scan_job_with_result(
+    repository: &Arc<Mutex<InMemoryRepository>>,
+    scan_job_id: Uuid,
+    scan_result: ScanResult,
+) -> Result<ScanJob, ApiError> {
+    let mut repository = repository.lock().map_err(|_| ApiError::internal())?;
+    let completed_at = Utc::now();
+    let scan_job = repository
+        .scan_jobs_by_id
+        .get_mut(&scan_job_id)
+        .ok_or_else(|| ApiError::not_found("scan job does not exist"))?;
+    scan_job.status = ScanStatus::Completed;
+    scan_job.completed_at = Some(completed_at);
+    let scan_job = scan_job.clone();
+
+    repository
+        .scan_results_by_id
+        .insert(scan_result.id, scan_result);
+
+    Ok(scan_job)
+}
+
 async fn run_dns_baseline_scan(
     State(repository): State<Arc<Mutex<InMemoryRepository>>>,
     headers: HeaderMap,
@@ -723,6 +795,64 @@ async fn run_dns_baseline_scan(
             )))
         }
     }
+}
+
+async fn run_http_probe_scan(
+    State(repository): State<Arc<Mutex<InMemoryRepository>>>,
+    headers: HeaderMap,
+    Path((organization_id, scan_job_id)): Path<(Uuid, Uuid)>,
+) -> Result<Json<RunDnsBaselineScanResponse>, ApiError> {
+    let user_id = current_user_id(&headers)?;
+    let (asset_id, domain) =
+        claim_scan_job_asset(&repository, user_id, organization_id, scan_job_id)?;
+    let observed_at = Utc::now();
+    let evidence = probe_http_endpoint(&domain, "https")
+        .await
+        .map_err(|error| ApiError::bad_gateway(format!("HTTPS probe failed: {error}")))?;
+    let scan_result = ScanResult {
+        id: Uuid::now_v7(),
+        organization_id,
+        asset_id,
+        scan_job_id,
+        source: "http_probe".to_string(),
+        observed_at,
+        evidence: ScanEvidence::HttpProbe(evidence),
+    };
+    let scan_job = complete_scan_job_with_result(&repository, scan_job_id, scan_result.clone())?;
+
+    Ok(Json(RunDnsBaselineScanResponse {
+        scan_job,
+        scan_result,
+    }))
+}
+
+async fn run_dns_policy_scan(
+    State(repository): State<Arc<Mutex<InMemoryRepository>>>,
+    headers: HeaderMap,
+    Path((organization_id, scan_job_id)): Path<(Uuid, Uuid)>,
+) -> Result<Json<RunDnsBaselineScanResponse>, ApiError> {
+    let user_id = current_user_id(&headers)?;
+    let (asset_id, domain) =
+        claim_scan_job_asset(&repository, user_id, organization_id, scan_job_id)?;
+    let observed_at = Utc::now();
+    let evidence = collect_dns_policy_baseline(&domain)
+        .await
+        .map_err(|error| ApiError::bad_gateway(format!("DNS policy scan failed: {error}")))?;
+    let scan_result = ScanResult {
+        id: Uuid::now_v7(),
+        organization_id,
+        asset_id,
+        scan_job_id,
+        source: "dns_policy".to_string(),
+        observed_at,
+        evidence: ScanEvidence::DnsPolicy(evidence),
+    };
+    let scan_job = complete_scan_job_with_result(&repository, scan_job_id, scan_result.clone())?;
+
+    Ok(Json(RunDnsBaselineScanResponse {
+        scan_job,
+        scan_result,
+    }))
 }
 
 async fn list_scan_results(

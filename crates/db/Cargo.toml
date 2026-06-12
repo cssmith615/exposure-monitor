@@ -7,5 +7,10 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+anyhow.workspace = true
+ceem-shared = { path = "../shared" }
+chrono.workspace = true
 serde.workspace = true
 sqlx.workspace = true
+tokio.workspace = true
+uuid.workspace = true

@@ -33,6 +33,13 @@ pub const MVP_RULES: &[FindingRule] = &[
         remediation: "Confirm the domain should resolve publicly or remove it from monitored production inventory.",
     },
     FindingRule {
+        id: "http_endpoint_unreachable",
+        title: "HTTP endpoint is unreachable",
+        severity: Severity::Medium,
+        confidence: Confidence::Medium,
+        remediation: "Confirm the endpoint is expected to be reachable or remove it from monitored production inventory.",
+    },
+    FindingRule {
         id: "tls_certificate_expiring_soon",
         title: "TLS certificate expires soon",
         severity: Severity::Medium,
@@ -52,6 +59,13 @@ pub const MVP_RULES: &[FindingRule] = &[
         severity: Severity::Medium,
         confidence: Confidence::High,
         remediation: "Publish a DMARC TXT record and start with a monitoring policy if needed.",
+    },
+    FindingRule {
+        id: "dns_missing_spf",
+        title: "Domain has no SPF record",
+        severity: Severity::Low,
+        confidence: Confidence::High,
+        remediation: "Publish an SPF TXT record that reflects authorized mail senders for the domain.",
     },
 ];
 
@@ -109,6 +123,56 @@ pub fn derive_findings_from_scan_result(scan_result: &ScanResult) -> Vec<Finding
 
             drafts
         }
+        ScanEvidence::HttpProbe(evidence) => {
+            let mut drafts = Vec::new();
+
+            if let Some(error) = &evidence.error {
+                drafts.push(draft_from_rule(
+                    "http_endpoint_unreachable",
+                    format!(
+                        "{} probe for {} failed: {error}.",
+                        evidence.scheme, evidence.domain
+                    ),
+                ));
+                return drafts;
+            }
+
+            if evidence.scheme == "https"
+                && evidence
+                    .security_headers
+                    .iter()
+                    .any(|header| header.name == "strict-transport-security" && !header.present)
+            {
+                drafts.push(draft_from_rule(
+                    "http_missing_hsts",
+                    format!(
+                        "HTTPS response for {} did not include HSTS.",
+                        evidence.domain
+                    ),
+                ));
+            }
+
+            drafts
+        }
+        ScanEvidence::DnsPolicy(evidence) => {
+            let mut drafts = Vec::new();
+
+            if evidence.dmarc_record.is_none() {
+                drafts.push(draft_from_rule(
+                    "dns_missing_dmarc",
+                    format!("No DMARC TXT record was observed for {}.", evidence.domain),
+                ));
+            }
+
+            if evidence.spf_record.is_none() {
+                drafts.push(draft_from_rule(
+                    "dns_missing_spf",
+                    format!("No SPF TXT record was observed for {}.", evidence.domain),
+                ));
+            }
+
+            drafts
+        }
     }
 }
 
@@ -129,7 +193,8 @@ fn draft_from_rule(rule_id: &str, evidence: String) -> FindingDraft {
 mod tests {
     use super::*;
     use ceem_shared::{
-        DnsAddressRecord, DnsAddressRecordKind, DnsBaselineEvidence, ScanEvidence, ScanResult,
+        DnsAddressRecord, DnsAddressRecordKind, DnsBaselineEvidence, DnsPolicyEvidence,
+        HttpProbeEvidence, ScanEvidence, ScanResult, SecurityHeaderObservation,
     };
     use chrono::Utc;
     use uuid::Uuid;
@@ -162,5 +227,56 @@ mod tests {
 
         assert_eq!(findings.len(), 1);
         assert_eq!(findings[0].rule_id, "dns_public_address_observed");
+    }
+
+    #[test]
+    fn derives_http_security_header_finding() {
+        let scan_result = ScanResult {
+            id: Uuid::now_v7(),
+            organization_id: Uuid::now_v7(),
+            asset_id: Uuid::now_v7(),
+            scan_job_id: Uuid::now_v7(),
+            source: "http_probe".to_string(),
+            observed_at: Utc::now(),
+            evidence: ScanEvidence::HttpProbe(HttpProbeEvidence {
+                domain: "example.com".to_string(),
+                scheme: "https".to_string(),
+                status_code: Some(200),
+                final_url: Some("https://example.com/".to_string()),
+                redirect_chain: Vec::new(),
+                security_headers: vec![SecurityHeaderObservation {
+                    name: "strict-transport-security".to_string(),
+                    value: None,
+                    present: false,
+                }],
+                tls: None,
+                error: None,
+            }),
+        };
+
+        let findings = derive_findings_from_scan_result(&scan_result);
+
+        assert_eq!(findings[0].rule_id, "http_missing_hsts");
+    }
+
+    #[test]
+    fn derives_dns_policy_findings() {
+        let scan_result = ScanResult {
+            id: Uuid::now_v7(),
+            organization_id: Uuid::now_v7(),
+            asset_id: Uuid::now_v7(),
+            scan_job_id: Uuid::now_v7(),
+            source: "dns_policy".to_string(),
+            observed_at: Utc::now(),
+            evidence: ScanEvidence::DnsPolicy(DnsPolicyEvidence {
+                domain: "example.com".to_string(),
+                spf_record: None,
+                dmarc_record: None,
+            }),
+        };
+
+        let findings = derive_findings_from_scan_result(&scan_result);
+
+        assert_eq!(findings.len(), 2);
     }
 }
