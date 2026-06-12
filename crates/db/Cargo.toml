@@ -1,0 +1,11 @@
+[package]
+name = "ceem-db"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+serde.workspace = true
+sqlx.workspace = true

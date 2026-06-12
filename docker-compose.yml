@@ -1,0 +1,20 @@
+services:
+  postgres:
+    image: postgres:17
+    container_name: ceem-postgres
+    environment:
+      POSTGRES_USER: ceem
+      POSTGRES_PASSWORD: ceem
+      POSTGRES_DB: ceem
+    ports:
+      - "5432:5432"
+    volumes:
+      - ceem-postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ceem -d ceem"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  ceem-postgres-data:

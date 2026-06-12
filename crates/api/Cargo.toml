@@ -1,0 +1,24 @@
+[package]
+name = "ceem-api"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+axum.workspace = true
+ceem-auth = { path = "../auth" }
+ceem-alerts = { path = "../alerts" }
+ceem-findings = { path = "../findings" }
+ceem-scanner = { path = "../scanner" }
+ceem-shared = { path = "../shared" }
+chrono.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tower-http.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+uuid.workspace = true
