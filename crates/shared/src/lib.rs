@@ -465,6 +465,36 @@ pub struct QueueSlackAlertResponse {
     pub alert: Alert,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct OrganizationAlertSettings {
+    pub organization_id: Uuid,
+    pub minimum_severity: Severity,
+    pub suppression_window_hours: i32,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct UpdateAlertSettingsRequest {
+    pub minimum_severity: Severity,
+    pub suppression_window_hours: i32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AlertSettingsResponse {
+    pub settings: OrganizationAlertSettings,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DevSeedResponse {
+    pub user: UserAccount,
+    pub session: SessionToken,
+    pub organization: Organization,
+    pub asset: DomainAsset,
+    pub scheduled_scan: ScheduledScan,
+    pub alert_settings: OrganizationAlertSettings,
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum RemediationStatus {

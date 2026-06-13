@@ -19,19 +19,20 @@ use ceem_db::{DatabaseConfig, PostgresRepository};
 use ceem_findings::derive_findings_from_scan_result;
 use ceem_scanner::{collect_dns_policy_baseline, probe_http_endpoint, resolve_dns_baseline};
 use ceem_shared::{
-    AcceptOrganizationInviteResponse, Alert, AlertStatus, AuditLog, Confidence,
-    CreateDomainAssetRequest, CreateDomainAssetResponse, CreateFindingNoteRequest,
+    AcceptOrganizationInviteResponse, Alert, AlertSettingsResponse, AlertStatus, AuditLog,
+    Confidence, CreateDomainAssetRequest, CreateDomainAssetResponse, CreateFindingNoteRequest,
     CreateFindingNoteResponse, CreateOrganizationInviteRequest, CreateOrganizationInviteResponse,
     CreateOrganizationRequest, CreateOrganizationResponse, CreateRemediationTaskRequest,
     CreateRemediationTaskResponse, CreateScanJobRequest, CreateScanJobResponse,
     CreateScheduledScanRequest, CreateSlackChannelRequest, CreateSlackChannelResponse,
-    DeriveFindingsResponse, DomainAsset, Finding, FindingEvent, FindingStatus, HealthResponse,
-    LoginRequest, LoginResponse, MemberRole, Organization, OrganizationInvite, OrganizationMember,
-    OrganizationMembership, OrganizationSummary, PRODUCT_NAME, QueueSlackAlertResponse,
-    RegisterUserRequest, RegisterUserResponse, RemediationStatus, RemediationTask,
-    RunDnsBaselineScanResponse, ScanCadence, ScanEvidence, ScanJob, ScanProfile, ScanResult,
-    ScanStatus, ScheduledScan, ScheduledScanResponse, ServiceStatus, SessionToken, Severity,
-    SlackNotificationChannel, UpdateFindingStatusRequest, UpdateFindingStatusResponse,
+    DeriveFindingsResponse, DevSeedResponse, DomainAsset, Finding, FindingEvent, FindingStatus,
+    HealthResponse, LoginRequest, LoginResponse, MemberRole, Organization,
+    OrganizationAlertSettings, OrganizationInvite, OrganizationMember, OrganizationMembership,
+    OrganizationSummary, PRODUCT_NAME, QueueSlackAlertResponse, RegisterUserRequest,
+    RegisterUserResponse, RemediationStatus, RemediationTask, RunDnsBaselineScanResponse,
+    ScanCadence, ScanEvidence, ScanJob, ScanProfile, ScanResult, ScanStatus, ScheduledScan,
+    ScheduledScanResponse, ServiceStatus, SessionToken, Severity, SlackNotificationChannel,
+    UpdateAlertSettingsRequest, UpdateFindingStatusRequest, UpdateFindingStatusResponse,
     UpdateMemberRoleRequest, UpdateMemberRoleResponse, UpdateRemediationStatusRequest,
     UpdateRemediationStatusResponse, UpdateScheduledScanRequest, UserAccount,
     calculate_finding_risk_score, finding_risk_factors, validate_domain, validate_slug,
@@ -69,6 +70,7 @@ fn app(pool: PgPool) -> Router {
 
     Router::new()
         .route("/healthz", get(healthz))
+        .route("/v1/dev/seed", post(seed_dev_workspace))
         .route("/v1/auth/register", post(register_user))
         .route("/v1/auth/login", post(login_user))
         .route(
@@ -168,6 +170,14 @@ fn app(pool: PgPool) -> Router {
             post(deliver_alert),
         )
         .route(
+            "/v1/organizations/{organization_id}/alerts/{alert_id}/retry",
+            post(retry_alert),
+        )
+        .route(
+            "/v1/organizations/{organization_id}/alert-settings",
+            get(get_alert_settings).post(update_alert_settings),
+        )
+        .route(
             "/v1/organizations/{organization_id}/findings/{finding_id}/remediation-tasks",
             post(create_remediation_task),
         )
@@ -227,6 +237,121 @@ impl FromRef<AppState> for PgPool {
     fn from_ref(state: &AppState) -> Self {
         state.pool.clone()
     }
+}
+
+async fn seed_dev_workspace(State(pool): State<PgPool>) -> Result<Json<DevSeedResponse>, ApiError> {
+    if !dev_seed_enabled() {
+        return Err(ApiError::not_found("dev seed is disabled"));
+    }
+
+    let email = "demo@ceem.local";
+    let password = "correct-horse-7!";
+    let user = if let Some((user, _)) = find_user_by_email(&pool, email).await? {
+        user
+    } else {
+        let password_hash = hash_password(password).map_err(|_| ApiError::internal())?;
+        let row = sqlx::query(
+            r#"
+            INSERT INTO users (id, email, display_name, password_hash)
+            VALUES ($1, $2, $3, $4)
+            RETURNING id, email, display_name, created_at
+            "#,
+        )
+        .bind(Uuid::now_v7())
+        .bind(email)
+        .bind("CEEM Demo Operator")
+        .bind(password_hash)
+        .fetch_one(&pool)
+        .await
+        .map_err(map_sql_error)?;
+        user_from_row(&row)
+    };
+
+    let organization =
+        if let Some(organization) = organization_by_slug(&pool, "demo-startup").await? {
+            organization
+        } else {
+            let row = sqlx::query(
+                r#"
+            INSERT INTO organizations (id, name, slug)
+            VALUES ($1, $2, $3)
+            RETURNING id, name, slug, created_at
+            "#,
+            )
+            .bind(Uuid::now_v7())
+            .bind("Demo Startup")
+            .bind("demo-startup")
+            .fetch_one(&pool)
+            .await
+            .map_err(map_sql_error)?;
+            organization_from_row(&row)
+        };
+
+    sqlx::query(
+        r#"
+        INSERT INTO organization_members (organization_id, user_id, role)
+        VALUES ($1, $2, 'owner')
+        ON CONFLICT (organization_id, user_id)
+        DO UPDATE SET role = 'owner'
+        "#,
+    )
+    .bind(organization.id)
+    .bind(user.id)
+    .execute(&pool)
+    .await
+    .map_err(map_sql_error)?;
+
+    let asset_row = sqlx::query(
+        r#"
+        INSERT INTO assets (id, organization_id, kind, value, authorization_attested_by)
+        VALUES ($1, $2, 'domain', $3, $4)
+        ON CONFLICT (organization_id, kind, value)
+        DO UPDATE SET updated_at = now()
+        RETURNING id, organization_id, value, authorization_attested_by,
+            authorization_attested_at, created_at
+        "#,
+    )
+    .bind(Uuid::now_v7())
+    .bind(organization.id)
+    .bind("example.com")
+    .bind(user.id)
+    .fetch_one(&pool)
+    .await
+    .map_err(map_sql_error)?;
+    let asset = domain_asset_from_row(&asset_row);
+
+    let settings = upsert_alert_settings(&pool, organization.id, Severity::High, 24).await?;
+    let scheduled_scan = upsert_scheduled_scan(
+        &pool,
+        organization.id,
+        asset.id,
+        user.id,
+        ScanCadence::Daily,
+        ScanProfile::FullDomainBaseline,
+        true,
+    )
+    .await?;
+
+    record_audit(
+        &pool,
+        Some(organization.id),
+        Some(user.id),
+        "dev.seeded",
+        "organization",
+        Some(organization.id),
+        json!({ "asset_id": asset.id }),
+    )
+    .await?;
+    let session = session_for_user(user.id)?;
+
+    Ok(Json(DevSeedResponse {
+        user,
+        session,
+        organization,
+        asset,
+        scheduled_scan,
+        alert_settings: settings,
+    }))
 }
 
 async fn register_user(
@@ -348,6 +473,7 @@ async fn create_organization(
     .await
     .map_err(map_sql_error)?;
     transaction.commit().await.map_err(map_sql_error)?;
+    upsert_alert_settings(&pool, organization.id, Severity::High, 24).await?;
 
     Ok(Json(CreateOrganizationResponse {
         organization,
@@ -767,34 +893,16 @@ async fn create_scheduled_scan(
         ));
     }
     require_asset_in_org(&pool, organization_id, asset_id).await?;
-    let next_run_at = next_run_for_cadence(request.cadence);
-    let row = sqlx::query(
-        r#"
-        INSERT INTO scheduled_scans (
-            id, organization_id, asset_id, cadence, profile, enabled, next_run_at, created_by
-        )
-        VALUES ($1, $2, $3, $4::scan_cadence, $5::scan_profile, true, $6, $7)
-        ON CONFLICT (asset_id, profile)
-        DO UPDATE SET
-            cadence = EXCLUDED.cadence,
-            enabled = true,
-            next_run_at = EXCLUDED.next_run_at,
-            updated_at = now()
-        RETURNING id, organization_id, asset_id, cadence::text AS cadence, profile::text AS profile,
-            enabled, next_run_at, last_enqueued_at, created_by, created_at, updated_at
-        "#,
+    let scheduled_scan = upsert_scheduled_scan(
+        &pool,
+        organization_id,
+        asset_id,
+        user_id,
+        request.cadence,
+        request.profile,
+        true,
     )
-    .bind(Uuid::now_v7())
-    .bind(organization_id)
-    .bind(asset_id)
-    .bind(scan_cadence_slug(request.cadence))
-    .bind(scan_profile_slug(request.profile))
-    .bind(next_run_at)
-    .bind(user_id)
-    .fetch_one(&pool)
-    .await
-    .map_err(map_sql_error)?;
-    let scheduled_scan = scheduled_scan_from_row(&row);
+    .await?;
     record_audit(
         &pool,
         Some(organization_id),
@@ -1237,7 +1345,45 @@ async fn queue_slack_alert(
     let user_id = current_user_id(&headers)?;
     require_membership(&pool, user_id, organization_id).await?;
     let finding = require_finding_in_org(&pool, organization_id, finding_id).await?;
-    if let Some(alert) = active_alert_for_finding(&pool, finding_id).await? {
+    let settings = get_or_create_alert_settings(&pool, organization_id).await?;
+    let channel = first_enabled_slack_channel(&pool, organization_id)
+        .await?
+        .ok_or_else(|| ApiError::conflict("no enabled Slack notification channel exists"))?;
+    let domain = domain_for_asset(&pool, finding.asset_id)
+        .await?
+        .unwrap_or_else(|| "unknown-domain".to_string());
+    let payload = build_slack_finding_alert(&finding, &domain).text;
+
+    if severity_rank(finding.severity) < severity_rank(settings.minimum_severity) {
+        let suppressed = insert_alert(
+            &pool,
+            organization_id,
+            finding_id,
+            channel.id,
+            AlertStatus::Suppressed,
+            payload,
+        )
+        .await?;
+        record_audit(
+            &pool,
+            Some(organization_id),
+            Some(user_id),
+            "alert.suppressed",
+            "finding",
+            Some(finding_id),
+            json!({
+                "reason": "below_severity_threshold",
+                "finding_severity": severity_slug(finding.severity),
+                "minimum_severity": severity_slug(settings.minimum_severity)
+            }),
+        )
+        .await?;
+        return Ok(Json(QueueSlackAlertResponse { alert: suppressed }));
+    }
+
+    if let Some(alert) =
+        active_alert_for_finding(&pool, finding_id, settings.suppression_window_hours).await?
+    {
         let suppressed = insert_alert(
             &pool,
             organization_id,
@@ -1260,13 +1406,6 @@ async fn queue_slack_alert(
         return Ok(Json(QueueSlackAlertResponse { alert: suppressed }));
     }
 
-    let channel = first_enabled_slack_channel(&pool, organization_id)
-        .await?
-        .ok_or_else(|| ApiError::conflict("no enabled Slack notification channel exists"))?;
-    let domain = domain_for_asset(&pool, finding.asset_id)
-        .await?
-        .unwrap_or_else(|| "unknown-domain".to_string());
-    let payload = build_slack_finding_alert(&finding, &domain).text;
     let alert = insert_alert(
         &pool,
         organization_id,
@@ -1289,6 +1428,57 @@ async fn queue_slack_alert(
     .await?;
 
     Ok(Json(QueueSlackAlertResponse { alert }))
+}
+
+async fn get_alert_settings(
+    State(pool): State<PgPool>,
+    headers: HeaderMap,
+    Path(organization_id): Path<Uuid>,
+) -> Result<Json<AlertSettingsResponse>, ApiError> {
+    let user_id = current_user_id(&headers)?;
+    require_membership(&pool, user_id, organization_id).await?;
+    let settings = get_or_create_alert_settings(&pool, organization_id).await?;
+    Ok(Json(AlertSettingsResponse { settings }))
+}
+
+async fn update_alert_settings(
+    State(pool): State<PgPool>,
+    headers: HeaderMap,
+    Path(organization_id): Path<Uuid>,
+    Json(request): Json<UpdateAlertSettingsRequest>,
+) -> Result<Json<AlertSettingsResponse>, ApiError> {
+    let user_id = current_user_id(&headers)?;
+    let role = require_membership(&pool, user_id, organization_id).await?;
+    if matches!(role, MemberRole::Viewer) {
+        return Err(ApiError::forbidden("viewers cannot update alert settings"));
+    }
+    if !(1..=720).contains(&request.suppression_window_hours) {
+        return Err(ApiError::bad_request(
+            "suppression window must be between 1 and 720 hours",
+        ));
+    }
+    let settings = upsert_alert_settings(
+        &pool,
+        organization_id,
+        request.minimum_severity,
+        request.suppression_window_hours,
+    )
+    .await?;
+    record_audit(
+        &pool,
+        Some(organization_id),
+        Some(user_id),
+        "alert_settings.updated",
+        "organization",
+        Some(organization_id),
+        json!({
+            "minimum_severity": severity_slug(settings.minimum_severity),
+            "suppression_window_hours": settings.suppression_window_hours
+        }),
+    )
+    .await?;
+
+    Ok(Json(AlertSettingsResponse { settings }))
 }
 
 async fn list_alerts(
@@ -1392,6 +1582,50 @@ async fn deliver_alert(
     .await?;
 
     Ok(Json(QueueSlackAlertResponse { alert: updated }))
+}
+
+async fn retry_alert(
+    State(pool): State<PgPool>,
+    headers: HeaderMap,
+    Path((organization_id, alert_id)): Path<(Uuid, Uuid)>,
+) -> Result<Json<QueueSlackAlertResponse>, ApiError> {
+    let user_id = current_user_id(&headers)?;
+    let role = require_membership(&pool, user_id, organization_id).await?;
+    if matches!(role, MemberRole::Viewer) {
+        return Err(ApiError::forbidden("viewers cannot retry alert delivery"));
+    }
+    let row = sqlx::query(
+        r#"
+        UPDATE alerts
+        SET status = 'queued',
+            next_attempt_at = now(),
+            locked_at = NULL,
+            error_message = NULL
+        WHERE id = $1 AND organization_id = $2 AND status = 'failed'
+        RETURNING id, organization_id, finding_id, notification_channel_id, status::text AS status,
+            payload, created_at, sent_at, attempts, next_attempt_at, error_message
+        "#,
+    )
+    .bind(alert_id)
+    .bind(organization_id)
+    .fetch_optional(&pool)
+    .await
+    .map_err(map_sql_error)?
+    .ok_or_else(|| ApiError::conflict("only failed alerts can be retried"))?;
+    let alert = alert_from_row(&row);
+
+    record_audit(
+        &pool,
+        Some(organization_id),
+        Some(user_id),
+        "alert.retry_queued",
+        "alert",
+        Some(alert_id),
+        json!({}),
+    )
+    .await?;
+
+    Ok(Json(QueueSlackAlertResponse { alert }))
 }
 
 async fn create_remediation_task(
@@ -1729,6 +1963,101 @@ async fn insert_finding_event(
     Ok(finding_event_from_row(&row))
 }
 
+async fn upsert_scheduled_scan(
+    pool: &PgPool,
+    organization_id: Uuid,
+    asset_id: Uuid,
+    user_id: Uuid,
+    cadence: ScanCadence,
+    profile: ScanProfile,
+    enabled: bool,
+) -> Result<ScheduledScan, ApiError> {
+    let next_run_at = if enabled {
+        next_run_for_cadence(cadence)
+    } else {
+        None
+    };
+    let row = sqlx::query(
+        r#"
+        INSERT INTO scheduled_scans (
+            id, organization_id, asset_id, cadence, profile, enabled, next_run_at, created_by
+        )
+        VALUES ($1, $2, $3, $4::scan_cadence, $5::scan_profile, $6, $7, $8)
+        ON CONFLICT (asset_id, profile)
+        DO UPDATE SET
+            cadence = EXCLUDED.cadence,
+            enabled = EXCLUDED.enabled,
+            next_run_at = EXCLUDED.next_run_at,
+            updated_at = now()
+        RETURNING id, organization_id, asset_id, cadence::text AS cadence, profile::text AS profile,
+            enabled, next_run_at, last_enqueued_at, created_by, created_at, updated_at
+        "#,
+    )
+    .bind(Uuid::now_v7())
+    .bind(organization_id)
+    .bind(asset_id)
+    .bind(scan_cadence_slug(cadence))
+    .bind(scan_profile_slug(profile))
+    .bind(enabled)
+    .bind(next_run_at)
+    .bind(user_id)
+    .fetch_one(pool)
+    .await
+    .map_err(map_sql_error)?;
+    Ok(scheduled_scan_from_row(&row))
+}
+
+async fn get_or_create_alert_settings(
+    pool: &PgPool,
+    organization_id: Uuid,
+) -> Result<OrganizationAlertSettings, ApiError> {
+    let row = sqlx::query(
+        r#"
+        INSERT INTO organization_alert_settings (organization_id)
+        VALUES ($1)
+        ON CONFLICT (organization_id)
+        DO UPDATE SET organization_id = EXCLUDED.organization_id
+        RETURNING organization_id, minimum_severity::text AS minimum_severity,
+            suppression_window_hours, created_at, updated_at
+        "#,
+    )
+    .bind(organization_id)
+    .fetch_one(pool)
+    .await
+    .map_err(map_sql_error)?;
+    Ok(alert_settings_from_row(&row))
+}
+
+async fn upsert_alert_settings(
+    pool: &PgPool,
+    organization_id: Uuid,
+    minimum_severity: Severity,
+    suppression_window_hours: i32,
+) -> Result<OrganizationAlertSettings, ApiError> {
+    let row = sqlx::query(
+        r#"
+        INSERT INTO organization_alert_settings (
+            organization_id, minimum_severity, suppression_window_hours
+        )
+        VALUES ($1, $2::severity, $3)
+        ON CONFLICT (organization_id)
+        DO UPDATE SET
+            minimum_severity = EXCLUDED.minimum_severity,
+            suppression_window_hours = EXCLUDED.suppression_window_hours,
+            updated_at = now()
+        RETURNING organization_id, minimum_severity::text AS minimum_severity,
+            suppression_window_hours, created_at, updated_at
+        "#,
+    )
+    .bind(organization_id)
+    .bind(severity_slug(minimum_severity))
+    .bind(suppression_window_hours)
+    .fetch_one(pool)
+    .await
+    .map_err(map_sql_error)?;
+    Ok(alert_settings_from_row(&row))
+}
+
 async fn insert_alert(
     pool: &PgPool,
     organization_id: Uuid,
@@ -1970,20 +2299,22 @@ async fn list_members(
 async fn active_alert_for_finding(
     pool: &PgPool,
     finding_id: Uuid,
+    suppression_window_hours: i32,
 ) -> Result<Option<Alert>, ApiError> {
     let row = sqlx::query(
         r#"
         SELECT id, organization_id, finding_id, notification_channel_id, status::text AS status,
-            payload, created_at, sent_at
+            payload, created_at, sent_at, attempts, next_attempt_at, error_message
         FROM alerts
         WHERE finding_id = $1
           AND status IN ('queued', 'sent', 'suppressed')
-          AND created_at >= now() - interval '24 hours'
+          AND created_at >= now() - make_interval(hours => $2)
         ORDER BY created_at DESC
         LIMIT 1
         "#,
     )
     .bind(finding_id)
+    .bind(suppression_window_hours)
     .fetch_optional(pool)
     .await
     .map_err(map_sql_error)?;
@@ -2190,6 +2521,16 @@ fn alert_from_row(row: &PgRow) -> Alert {
     }
 }
 
+fn alert_settings_from_row(row: &PgRow) -> OrganizationAlertSettings {
+    OrganizationAlertSettings {
+        organization_id: row.get("organization_id"),
+        minimum_severity: parse_severity(row.get("minimum_severity")),
+        suppression_window_hours: row.get("suppression_window_hours"),
+        created_at: row.get("created_at"),
+        updated_at: row.get("updated_at"),
+    }
+}
+
 fn remediation_task_from_row(row: &PgRow) -> RemediationTask {
     RemediationTask {
         id: row.get("id"),
@@ -2353,6 +2694,12 @@ fn session_secret() -> String {
         .unwrap_or_else(|_| "dev-only-change-me-before-production".to_string())
 }
 
+fn dev_seed_enabled() -> bool {
+    std::env::var("CEEM_ENABLE_DEV_SEED")
+        .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+}
+
 fn current_user_id(headers: &HeaderMap) -> Result<Uuid, ApiError> {
     if let Some(value) = headers.get("authorization") {
         let value = value
@@ -2469,6 +2816,16 @@ fn parse_severity(value: &str) -> Severity {
         "high" => Severity::High,
         "critical" => Severity::Critical,
         _ => Severity::Info,
+    }
+}
+
+fn severity_rank(severity: Severity) -> i32 {
+    match severity {
+        Severity::Info => 0,
+        Severity::Low => 1,
+        Severity::Medium => 2,
+        Severity::High => 3,
+        Severity::Critical => 4,
     }
 }
 

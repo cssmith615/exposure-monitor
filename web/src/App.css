@@ -54,12 +54,15 @@
 
 .auth-form input,
 .domain-form input,
+.domain-form select,
 .note-form input,
-.topbar select {
+.topbar select,
+.schedule-editor select {
   background: rgba(255, 255, 255, 0.06);
   border: 1px solid rgba(124, 247, 212, 0.18);
   border-radius: 8px;
   color: #f5fff9;
+  color-scheme: dark;
   font: inherit;
   min-height: 44px;
   min-width: 0;
@@ -68,7 +71,6 @@
 }
 
 .topbar select {
-  color-scheme: dark;
   max-width: 220px;
 }
 
@@ -567,7 +569,7 @@ button:disabled {
   align-items: center;
   border-top: 1px solid rgba(124, 247, 212, 0.12);
   color: #d6e8e3;
-  grid-template-columns: auto 1fr auto;
+  grid-template-columns: auto minmax(180px, 1fr) minmax(360px, auto) auto;
   padding: 14px 0;
 }
 
@@ -588,6 +590,47 @@ button:disabled {
   color: #849994;
   font-size: 13px;
   margin-top: 2px;
+}
+
+.schedule-editor {
+  align-items: center;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  justify-content: flex-end;
+}
+
+.schedule-editor select {
+  font-size: 13px;
+  min-height: 36px;
+}
+
+.detail-editor {
+  justify-content: flex-start;
+  margin: -6px 0 18px;
+}
+
+.inline-toggle {
+  align-items: center;
+  background: rgba(255, 255, 255, 0.05);
+  border: 1px solid rgba(124, 247, 212, 0.16);
+  border-radius: 8px;
+  color: #cfe1dc;
+  display: inline-flex;
+  font-size: 13px;
+  gap: 8px;
+  min-height: 36px;
+  padding: 0 10px;
+}
+
+.inline-toggle input {
+  accent-color: #7cf7d4;
+}
+
+.alert-settings-form {
+  border-top: 1px solid rgba(124, 247, 212, 0.12);
+  margin-top: 16px;
+  padding-top: 16px;
 }
 
 .policy-list {
@@ -716,6 +759,11 @@ mark.high {
   color: #ff8f9f;
 }
 
+mark.critical {
+  background: rgba(255, 93, 115, 0.28);
+  color: #ffd5dc;
+}
+
 mark.medium {
   background: rgba(255, 200, 87, 0.16);
   color: #ffd98a;
@@ -724,6 +772,11 @@ mark.medium {
 mark.low {
   background: rgba(121, 167, 255, 0.16);
   color: #a7c2ff;
+}
+
+mark.info {
+  background: rgba(124, 247, 212, 0.12);
+  color: #bffff0;
 }
 
 mark.queued {
@@ -746,6 +799,7 @@ mark.completed {
   display: flex;
   flex-wrap: wrap;
   gap: 8px;
+  justify-content: flex-end;
 }
 
 .row-actions button,
@@ -791,6 +845,27 @@ mark.completed {
   border-top: 1px solid rgba(124, 247, 212, 0.1);
   margin: 0;
   padding: 9px 0;
+}
+
+.text-link {
+  background: transparent;
+  border: 0;
+  color: #7cf7d4;
+  display: inline;
+  font-size: inherit;
+  font-weight: 700;
+  min-height: 0;
+  padding: 0 0 0 8px;
+  text-align: left;
+}
+
+.text-link:first-child {
+  padding-left: 0;
+}
+
+.text-link:hover {
+  background: transparent;
+  color: #adffe9;
 }
 
 .raw-json {
@@ -975,5 +1050,15 @@ mark.completed {
 
   .stage-radar {
     grid-row: auto;
+  }
+
+  .scan-row {
+    grid-template-columns: auto 1fr;
+  }
+
+  .scan-row .schedule-editor,
+  .scan-row .row-actions {
+    grid-column: 1 / -1;
+    justify-content: flex-start;
   }
 }

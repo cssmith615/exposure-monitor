@@ -28,6 +28,8 @@ services:
       CEEM_BIND_ADDR: 0.0.0.0:8080
       DATABASE_URL: postgres://ceem:ceem@postgres:5432/ceem
       CEEM_SESSION_SECRET: ${CEEM_SESSION_SECRET:-dev-only-change-me-before-production}
+      CEEM_CORS_ORIGIN: ${CEEM_CORS_ORIGIN:-http://localhost:5317}
+      CEEM_ENABLE_DEV_SEED: ${CEEM_ENABLE_DEV_SEED:-true}
       RUST_LOG: ${RUST_LOG:-info}
     ports:
       - "8080:8080"

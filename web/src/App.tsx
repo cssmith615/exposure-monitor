@@ -12,6 +12,8 @@ import {
   Plus,
   Radar,
   RefreshCw,
+  RotateCcw,
+  Settings,
   ShieldCheck,
   Slack,
   TerminalSquare,
@@ -113,7 +115,7 @@ type Finding = {
   asset_id: string
   rule_id: string
   title: string
-  severity: 'info' | 'low' | 'medium' | 'high' | 'critical'
+  severity: Severity
   status: 'open' | 'accepted_risk' | 'false_positive' | 'in_progress' | 'remediated' | 'reopened'
   confidence: 'low' | 'medium' | 'high'
   evidence: string
@@ -149,6 +151,7 @@ type Alert = {
   error_message: string | null
 }
 
+type Severity = 'info' | 'low' | 'medium' | 'high' | 'critical'
 type ScanCadence = 'manual' | 'daily' | 'weekly'
 type ScanProfile = 'dns_baseline' | 'http_probe' | 'dns_policy' | 'full_domain_baseline'
 
@@ -188,6 +191,40 @@ type AuditLog = {
   created_at: string
 }
 
+type OrganizationAlertSettings = {
+  organization_id: string
+  minimum_severity: Severity
+  suppression_window_hours: number
+  created_at: string
+  updated_at: string
+}
+
+type AlertSettingsResponse = {
+  settings: OrganizationAlertSettings
+}
+
+type DevSeedResponse = {
+  user: UserAccount
+  session: SessionToken
+  organization: Organization
+  asset: DomainAsset
+  scheduled_scan: ScheduledScan
+  alert_settings: OrganizationAlertSettings
+}
+
+type ScheduleDraft = {
+  scheduleId?: string
+  cadence: ScanCadence
+  profile: ScanProfile
+  enabled: boolean
+}
+
+type DetailRoute =
+  | { kind: 'home' }
+  | { kind: 'asset'; id: string }
+  | { kind: 'finding'; id: string }
+  | { kind: 'scan'; id: string }
+
 type WorkspaceData = {
   assets: DomainAsset[]
   scanJobs: ScanJob[]
@@ -195,6 +232,7 @@ type WorkspaceData = {
   findings: Finding[]
   alerts: Alert[]
   scheduledScans: ScheduledScan[]
+  alertSettings: OrganizationAlertSettings | null
   remediationTasks: RemediationTask[]
   auditLogs: AuditLog[]
   members: OrganizationMember[]
@@ -207,6 +245,7 @@ const emptyWorkspace: WorkspaceData = {
   findings: [],
   alerts: [],
   scheduledScans: [],
+  alertSettings: null,
   remediationTasks: [],
   auditLogs: [],
   members: [],
@@ -231,6 +270,12 @@ function App() {
   const [activeFindingId, setActiveFindingId] = useState<string>('')
   const [activeAssetId, setActiveAssetId] = useState<string>('')
   const [activeScanResultId, setActiveScanResultId] = useState<string>('')
+  const [route, setRoute] = useState<DetailRoute>(() => parseRoute())
+  const [scheduleDrafts, setScheduleDrafts] = useState<Record<string, ScheduleDraft>>({})
+  const [alertSettingsDraft, setAlertSettingsDraft] = useState({
+    minimum_severity: 'high' as Severity,
+    suppression_window_hours: 24,
+  })
   const [findingEvents, setFindingEvents] = useState<FindingEvent[]>([])
   const [noteDraft, setNoteDraft] = useState('Accepted through launch week; revisit after automation lands.')
   const [isLoading, setIsLoading] = useState(false)
@@ -311,6 +356,7 @@ function App() {
         findings,
         alerts,
         scheduledScans,
+        alertSettingsResponse,
         remediationTasks,
         auditLogs,
         members,
@@ -321,11 +367,23 @@ function App() {
         api<Finding[]>(`/v1/organizations/${activeOrganizationId}/findings`),
         api<Alert[]>(`/v1/organizations/${activeOrganizationId}/alerts`),
         api<ScheduledScan[]>(`/v1/organizations/${activeOrganizationId}/scheduled-scans`),
+        api<AlertSettingsResponse>(`/v1/organizations/${activeOrganizationId}/alert-settings`),
         api<RemediationTask[]>(`/v1/organizations/${activeOrganizationId}/remediation-tasks`),
         api<AuditLog[]>(`/v1/organizations/${activeOrganizationId}/audit-logs`),
         api<OrganizationMember[]>(`/v1/organizations/${activeOrganizationId}/members`),
       ])
-      setWorkspace({ assets, scanJobs, scanResults, findings, alerts, scheduledScans, remediationTasks, auditLogs, members })
+      setWorkspace({
+        assets,
+        scanJobs,
+        scanResults,
+        findings,
+        alerts,
+        scheduledScans,
+        alertSettings: alertSettingsResponse.settings,
+        remediationTasks,
+        auditLogs,
+        members,
+      })
       setActiveFindingId((current) => current || findings[0]?.id || '')
       setActiveAssetId((current) => current || assets[0]?.id || '')
       setActiveScanResultId((current) => current || scanResults[0]?.id || '')
@@ -343,6 +401,58 @@ function App() {
   useEffect(() => {
     refreshWorkspace()
   }, [refreshWorkspace])
+
+  useEffect(() => {
+    const onPopState = () => setRoute(parseRoute())
+    window.addEventListener('popstate', onPopState)
+    return () => window.removeEventListener('popstate', onPopState)
+  }, [])
+
+  useEffect(() => {
+    if (route.kind === 'asset' && workspace.assets.some((asset) => asset.id === route.id)) {
+      setActiveAssetId(route.id)
+    }
+    if (route.kind === 'finding' && workspace.findings.some((finding) => finding.id === route.id)) {
+      setActiveFindingId(route.id)
+    }
+    if (route.kind === 'scan' && workspace.scanResults.some((scanResult) => scanResult.id === route.id)) {
+      setActiveScanResultId(route.id)
+    }
+  }, [route, workspace.assets, workspace.findings, workspace.scanResults])
+
+  useEffect(() => {
+    setScheduleDrafts((current) => {
+      const next: Record<string, ScheduleDraft> = {}
+      for (const asset of workspace.assets) {
+        const existing = preferredSchedule(workspace.scheduledScans, asset.id)
+        const currentDraft = current[asset.id]
+        next[asset.id] =
+          existing && (!currentDraft || currentDraft.scheduleId === existing.id)
+            ? {
+                scheduleId: existing.id,
+                cadence: existing.cadence,
+                profile: existing.profile,
+                enabled: existing.enabled,
+              }
+            : currentDraft ?? {
+                cadence: 'daily',
+                profile: 'full_domain_baseline',
+                enabled: true,
+              }
+      }
+      return next
+    })
+  }, [workspace.assets, workspace.scheduledScans])
+
+  useEffect(() => {
+    if (!workspace.alertSettings) {
+      return
+    }
+    setAlertSettingsDraft({
+      minimum_severity: workspace.alertSettings.minimum_severity,
+      suppression_window_hours: workspace.alertSettings.suppression_window_hours,
+    })
+  }, [workspace.alertSettings])
 
   useEffect(() => {
     if (!activeOrganizationId || !activeFindingId || !session) {
@@ -379,6 +489,27 @@ function App() {
       }
       localStorage.setItem(sessionStorageKey, JSON.stringify(enrichedSession))
       setSession(enrichedSession)
+    } catch (caught) {
+      setError(errorMessage(caught))
+    } finally {
+      setIsLoading(false)
+    }
+  }
+
+  async function seedDevWorkspace() {
+    setIsLoading(true)
+    setError(null)
+    try {
+      const response = await api<DevSeedResponse>('/v1/dev/seed', { method: 'POST' })
+      const enrichedSession = {
+        user: response.user,
+        session: response.session,
+        expires_at: Date.now() + response.session.expires_in_seconds * 1000,
+      }
+      localStorage.setItem(sessionStorageKey, JSON.stringify(enrichedSession))
+      setSession(enrichedSession)
+      setActiveOrganizationId(response.organization.id)
+      navigateTo(`/assets/${response.asset.id}`)
     } catch (caught) {
       setError(errorMessage(caught))
     } finally {
@@ -423,20 +554,67 @@ function App() {
     })
   }
 
-  async function saveSchedule(assetId: string, cadence: ScanCadence, profile: ScanProfile) {
+  async function saveSchedule(
+    assetId: string,
+    cadence: ScanCadence,
+    profile: ScanProfile,
+    enabled = true,
+    scheduleId?: string,
+  ) {
     await mutate(async () => {
-      await api(`/v1/organizations/${activeOrganizationId}/domain-assets/${assetId}/scheduled-scans`, {
-        method: 'POST',
-        body: JSON.stringify({ cadence, profile }),
-      })
+      if (scheduleId) {
+        await api(`/v1/organizations/${activeOrganizationId}/scheduled-scans/${scheduleId}`, {
+          method: 'POST',
+          body: JSON.stringify({ cadence, profile, enabled }),
+        })
+      } else {
+        await api(`/v1/organizations/${activeOrganizationId}/domain-assets/${assetId}/scheduled-scans`, {
+          method: 'POST',
+          body: JSON.stringify({ cadence, profile }),
+        })
+      }
       await refreshWorkspace()
     })
+  }
+
+  async function saveScheduleDraft(assetId: string) {
+    const draft = scheduleDrafts[assetId] ?? {
+      cadence: 'daily' as ScanCadence,
+      profile: 'full_domain_baseline' as ScanProfile,
+      enabled: true,
+    }
+    await saveSchedule(assetId, draft.cadence, draft.profile, draft.enabled, draft.scheduleId)
+  }
+
+  function updateScheduleDraft(assetId: string, patch: Partial<ScheduleDraft>) {
+    setScheduleDrafts((current) => ({
+      ...current,
+      [assetId]: {
+        ...(current[assetId] ?? {
+          cadence: 'daily' as ScanCadence,
+          profile: 'full_domain_baseline' as ScanProfile,
+          enabled: true,
+        }),
+        ...patch,
+      },
+    }))
   }
 
   async function pauseSchedule(scheduleId: string) {
     await mutate(async () => {
       await api(`/v1/organizations/${activeOrganizationId}/scheduled-scans/${scheduleId}/pause`, {
         method: 'POST',
+      })
+      await refreshWorkspace()
+    })
+  }
+
+  async function saveAlertSettings(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault()
+    await mutate(async () => {
+      await api(`/v1/organizations/${activeOrganizationId}/alert-settings`, {
+        method: 'POST',
+        body: JSON.stringify(alertSettingsDraft),
       })
       await refreshWorkspace()
     })
@@ -463,6 +641,15 @@ function App() {
   async function queueSlackAlert(findingId: string) {
     await mutate(async () => {
       await api(`/v1/organizations/${activeOrganizationId}/findings/${findingId}/slack-alerts`, {
+        method: 'POST',
+      })
+      await refreshWorkspace()
+    })
+  }
+
+  async function retryAlert(alertId: string) {
+    await mutate(async () => {
+      await api(`/v1/organizations/${activeOrganizationId}/alerts/${alertId}/retry`, {
         method: 'POST',
       })
       await refreshWorkspace()
@@ -557,6 +744,11 @@ function App() {
     }
   }
 
+  function navigateTo(path: string) {
+    window.history.pushState({}, '', path)
+    setRoute(parseRoute())
+  }
+
   function logout() {
     clearSession()
   }
@@ -621,6 +813,10 @@ function App() {
               onClick={() => setAuthMode(authMode === 'login' ? 'register' : 'login')}
             >
               {authMode === 'login' ? 'Need an account?' : 'Already registered?'}
+            </button>
+            <button className="secondary" disabled={isLoading} type="button" onClick={seedDevWorkspace}>
+              <Radar size={18} aria-hidden="true" />
+              Load dev workspace
             </button>
           </form>
         </section>
@@ -797,10 +993,46 @@ function App() {
               <div className="scan-row" key={asset.id}>
                 <CheckCircle2 size={18} aria-hidden="true" />
                 <span><strong>{asset.domain}</strong><small>{scheduleLabel(workspace.scheduledScans, asset.id)}</small></span>
+                <span className="schedule-editor">
+                  <select
+                    aria-label={`${asset.domain} cadence`}
+                    value={scheduleDrafts[asset.id]?.cadence ?? 'daily'}
+                    onChange={(event) =>
+                      updateScheduleDraft(asset.id, { cadence: event.target.value as ScanCadence })
+                    }
+                  >
+                    <option value="manual">Manual</option>
+                    <option value="daily">Daily</option>
+                    <option value="weekly">Weekly</option>
+                  </select>
+                  <select
+                    aria-label={`${asset.domain} scan profile`}
+                    value={scheduleDrafts[asset.id]?.profile ?? 'full_domain_baseline'}
+                    onChange={(event) =>
+                      updateScheduleDraft(asset.id, { profile: event.target.value as ScanProfile })
+                    }
+                  >
+                    <option value="dns_baseline">DNS baseline</option>
+                    <option value="http_probe">HTTP probe</option>
+                    <option value="dns_policy">DNS policy</option>
+                    <option value="full_domain_baseline">Full baseline</option>
+                  </select>
+                  <label className="inline-toggle">
+                    <input
+                      checked={scheduleDrafts[asset.id]?.enabled ?? true}
+                      onChange={(event) => updateScheduleDraft(asset.id, { enabled: event.target.checked })}
+                      type="checkbox"
+                    />
+                    <span>Enabled</span>
+                  </label>
+                  <button type="button" onClick={() => saveScheduleDraft(asset.id)}>
+                    <Settings size={15} aria-hidden="true" />
+                    Save
+                  </button>
+                </span>
                 <span className="row-actions">
-                  <button className="secondary" type="button" onClick={() => setActiveAssetId(asset.id)}>Details</button>
+                  <button className="secondary" type="button" onClick={() => navigateTo(`/assets/${asset.id}`)}>Details</button>
                   <button className="secondary" type="button" onClick={() => queueScan(asset.id)}>Scan</button>
-                  <button type="button" onClick={() => saveSchedule(asset.id, 'daily', 'full_domain_baseline')}>Daily full</button>
                 </span>
               </div>
             ))}
@@ -817,6 +1049,45 @@ function App() {
               <label>Webhook URL</label>
               <input value={slackWebhookUrl} onChange={(event) => setSlackWebhookUrl(event.target.value)} />
               <button disabled={!slackWebhookUrl} type="submit"><Bell size={18} aria-hidden="true" />Save Slack</button>
+            </form>
+            <form className="domain-form alert-settings-form" onSubmit={saveAlertSettings}>
+              <label>Minimum severity</label>
+              <select
+                value={alertSettingsDraft.minimum_severity}
+                onChange={(event) =>
+                  setAlertSettingsDraft((current) => ({
+                    ...current,
+                    minimum_severity: event.target.value as Severity,
+                  }))
+                }
+              >
+                <option value="info">Info</option>
+                <option value="low">Low</option>
+                <option value="medium">Medium</option>
+                <option value="high">High</option>
+                <option value="critical">Critical</option>
+              </select>
+              <label>Suppression window</label>
+              <select
+                value={alertSettingsDraft.suppression_window_hours}
+                onChange={(event) =>
+                  setAlertSettingsDraft((current) => ({
+                    ...current,
+                    suppression_window_hours: Number(event.target.value),
+                  }))
+                }
+              >
+                <option value={1}>1 hour</option>
+                <option value={6}>6 hours</option>
+                <option value={12}>12 hours</option>
+                <option value={24}>24 hours</option>
+                <option value={72}>72 hours</option>
+                <option value={168}>7 days</option>
+              </select>
+              <button type="submit">
+                <Settings size={18} aria-hidden="true" />
+                Save policy
+              </button>
             </form>
           </article>
         </section>
@@ -851,7 +1122,11 @@ function App() {
             <div className="panel-header">
               <div><p className="eyebrow">Asset detail</p><h2>{activeAsset.domain}</h2></div>
               <div className="row-actions">
-                <button className="secondary" type="button" onClick={() => saveSchedule(activeAsset.id, 'weekly', 'full_domain_baseline')}>Weekly full</button>
+                <button className="secondary" type="button" onClick={() => navigateTo('/')}>Overview</button>
+                <button type="button" onClick={() => saveScheduleDraft(activeAsset.id)}>
+                  <Settings size={15} aria-hidden="true" />
+                  Save schedule
+                </button>
                 {workspace.scheduledScans
                   .filter((schedule) => schedule.asset_id === activeAsset.id && schedule.enabled)
                   .slice(0, 1)
@@ -860,12 +1135,50 @@ function App() {
                   ))}
               </div>
             </div>
+            <div className="schedule-editor detail-editor">
+              <select
+                aria-label="Asset cadence"
+                value={scheduleDrafts[activeAsset.id]?.cadence ?? 'daily'}
+                onChange={(event) =>
+                  updateScheduleDraft(activeAsset.id, { cadence: event.target.value as ScanCadence })
+                }
+              >
+                <option value="manual">Manual</option>
+                <option value="daily">Daily</option>
+                <option value="weekly">Weekly</option>
+              </select>
+              <select
+                aria-label="Asset scan profile"
+                value={scheduleDrafts[activeAsset.id]?.profile ?? 'full_domain_baseline'}
+                onChange={(event) =>
+                  updateScheduleDraft(activeAsset.id, { profile: event.target.value as ScanProfile })
+                }
+              >
+                <option value="dns_baseline">DNS baseline</option>
+                <option value="http_probe">HTTP probe</option>
+                <option value="dns_policy">DNS policy</option>
+                <option value="full_domain_baseline">Full baseline</option>
+              </select>
+              <label className="inline-toggle">
+                <input
+                  checked={scheduleDrafts[activeAsset.id]?.enabled ?? true}
+                  onChange={(event) => updateScheduleDraft(activeAsset.id, { enabled: event.target.checked })}
+                  type="checkbox"
+                />
+                <span>Enabled</span>
+              </label>
+            </div>
             <div className="detail-grid">
               <div className="detail-block">
                 <span>Schedules</span>
                 {workspace.scheduledScans.filter((schedule) => schedule.asset_id === activeAsset.id).map((schedule) => (
-                  <p key={schedule.id}>{schedule.profile.replaceAll('_', ' ')} / {schedule.cadence} / {schedule.enabled ? 'enabled' : 'paused'}</p>
+                  <p key={schedule.id}>
+                    {schedule.profile.replaceAll('_', ' ')} / {schedule.cadence} / {schedule.enabled ? 'enabled' : 'paused'} / next {formatNullableTime(schedule.next_run_at)} / last {formatNullableTime(schedule.last_enqueued_at)}
+                  </p>
                 ))}
+                {workspace.scheduledScans.filter((schedule) => schedule.asset_id === activeAsset.id).length === 0 && (
+                  <p>No schedule saved yet.</p>
+                )}
               </div>
               <div className="detail-block">
                 <span>Recent scans</span>
@@ -876,7 +1189,11 @@ function App() {
               <div className="detail-block">
                 <span>Findings</span>
                 {workspace.findings.filter((finding) => finding.asset_id === activeAsset.id).slice(0, 4).map((finding) => (
-                  <p key={finding.id}>{finding.risk_score} / {finding.title}</p>
+                  <p key={finding.id}>
+                    <button className="text-link" type="button" onClick={() => navigateTo(`/findings/${finding.id}`)}>
+                      {finding.risk_score} / {finding.title}
+                    </button>
+                  </p>
                 ))}
               </div>
             </div>
@@ -895,7 +1212,7 @@ function App() {
                 <span><strong>{activeAssetById.get(item.asset_id)?.domain ?? evidenceDomain(item.evidence)}</strong><small>{item.source}</small></span>
                 <span className="address-stack">{evidenceSummary(item.evidence)}</span>
                 <span className="row-actions">
-                  <button className="secondary" type="button" onClick={() => setActiveScanResultId(item.id)}>Raw</button>
+                  <button className="secondary" type="button" onClick={() => navigateTo(`/scans/${item.id}`)}>Raw</button>
                   <span>{formatTime(item.observed_at)}</span>
                 </span>
               </div>
@@ -907,7 +1224,10 @@ function App() {
           <section className="panel detail-page" aria-label="Scan result detail">
             <div className="panel-header">
               <div><p className="eyebrow">Scan result detail</p><h2>{activeScanResult.source.replaceAll('_', ' ')}</h2></div>
-              <mark className="completed">{formatTime(activeScanResult.observed_at)}</mark>
+              <div className="row-actions">
+                <mark className="completed">{formatTime(activeScanResult.observed_at)}</mark>
+                <button className="secondary" type="button" onClick={() => navigateTo('/')}>Overview</button>
+              </div>
             </div>
             <pre className="raw-json">{JSON.stringify(activeScanResult.evidence, null, 2)}</pre>
           </section>
@@ -929,7 +1249,7 @@ function App() {
                 <span className="row-actions">
                   <button type="button" onClick={() => queueSlackAlert(finding.id)}><Slack size={15} aria-hidden="true" />Queue</button>
                   <button className="secondary" type="button" onClick={() => createRemediationTask(finding.id)}><Plus size={15} aria-hidden="true" />Task</button>
-                  <button className="secondary" type="button" onClick={() => setActiveFindingId(finding.id)}>Review</button>
+                  <button className="secondary" type="button" onClick={() => navigateTo(`/findings/${finding.id}`)}>Review</button>
                 </span>
               </div>
             ))}
@@ -940,7 +1260,10 @@ function App() {
           <section className="panel finding-activity" aria-label="Finding activity">
             <div className="panel-header">
               <div><p className="eyebrow">Finding activity</p><h2>{activeFinding.title}</h2></div>
-              <mark className={activeFinding.severity}>{activeFinding.severity}</mark>
+              <div className="row-actions">
+                <mark className={activeFinding.severity}>{activeFinding.severity}</mark>
+                <button className="secondary" type="button" onClick={() => navigateTo('/')}>Overview</button>
+              </div>
             </div>
             <div className="activity-layout">
               <div className="activity-summary">
@@ -974,7 +1297,14 @@ function App() {
               <div className="detail-block">
                 <span>Slack alerts</span>
                 {workspace.alerts.filter((alert) => alert.finding_id === activeFinding.id).map((alert) => (
-                  <p key={alert.id}>{alert.status} / attempts {alert.attempts} / {alert.error_message ?? 'no error'}</p>
+                  <p key={alert.id}>
+                    {alert.status} / attempts {alert.attempts} / {alert.error_message ?? 'no error'}
+                    {alert.status === 'failed' && (
+                      <button className="text-link" type="button" onClick={() => retryAlert(alert.id)}>
+                        retry
+                      </button>
+                    )}
+                  </p>
                 ))}
               </div>
               <div className="detail-block">
@@ -993,15 +1323,36 @@ function App() {
 
         <section className="ops-grid">
           <article className="panel alert-queue" aria-label="Alert queue">
-            <div className="panel-header compact"><div><p className="eyebrow">Slack queue</p><h2>Alert dispatch</h2></div></div>
+            <div className="panel-header compact">
+              <div><p className="eyebrow">Worker alert history</p><h2>Slack delivery</h2></div>
+              <mark className="queued">{workspace.alertSettings?.minimum_severity ?? 'high'}+</mark>
+            </div>
             <div className="compact-list">
               {workspace.alerts.map((alert) => (
                 <div className="compact-row" key={alert.id}>
                   <span className="job-id">{shortId(alert.id)}</span>
-                  <span><strong>{workspace.findings.find((finding) => finding.id === alert.finding_id)?.title ?? alert.finding_id}</strong><small>{alert.payload}</small><small>Attempts {alert.attempts}{alert.next_attempt_at ? ` / retry ${formatTime(alert.next_attempt_at)}` : ''}</small></span>
-                  <mark className={alert.status}>{alert.status}</mark>
+                  <span>
+                    <strong>{workspace.findings.find((finding) => finding.id === alert.finding_id)?.title ?? alert.finding_id}</strong>
+                    <small>{alert.payload}</small>
+                    <small>
+                      Attempts {alert.attempts}
+                      {alert.next_attempt_at ? ` / next retry ${formatTime(alert.next_attempt_at)}` : ''}
+                      {alert.sent_at ? ` / sent ${formatTime(alert.sent_at)}` : ''}
+                      {alert.error_message ? ` / ${alert.error_message}` : ''}
+                    </small>
+                  </span>
+                  <span className="row-actions">
+                    {alert.status === 'failed' && (
+                      <button className="secondary" type="button" onClick={() => retryAlert(alert.id)}>
+                        <RotateCcw size={15} aria-hidden="true" />
+                        Retry
+                      </button>
+                    )}
+                    <mark className={alert.status}>{alert.status}</mark>
+                  </span>
                 </div>
               ))}
+              {workspace.alerts.length === 0 && <p className="empty-state">No Slack delivery events yet.</p>}
             </div>
           </article>
 
@@ -1081,6 +1432,10 @@ function formatTime(value: string) {
   return new Date(value).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
 }
 
+function formatNullableTime(value: string | null) {
+  return value ? formatTime(value) : 'none'
+}
+
 function shortId(value: string) {
   return value.slice(0, 8)
 }
@@ -1110,12 +1465,34 @@ function evidenceSummary(evidence: ScanEvidence) {
 }
 
 function scheduleLabel(schedules: ScheduledScan[], assetId: string) {
-  const active = schedules.find((schedule) => schedule.asset_id === assetId && schedule.enabled)
+  const active = preferredSchedule(schedules, assetId)
   if (!active) {
     return 'No active schedule'
   }
   const next = active.next_run_at ? formatTime(active.next_run_at) : 'manual only'
-  return `${active.cadence} / ${active.profile.replaceAll('_', ' ')} / next ${next}`
+  const status = active.enabled ? 'enabled' : 'paused'
+  const last = active.last_enqueued_at ? ` / last ${formatTime(active.last_enqueued_at)}` : ''
+  return `${active.cadence} / ${active.profile.replaceAll('_', ' ')} / ${status} / next ${next}${last}`
+}
+
+function preferredSchedule(schedules: ScheduledScan[], assetId: string) {
+  return schedules
+    .filter((schedule) => schedule.asset_id === assetId)
+    .sort((left, right) => Number(right.enabled) - Number(left.enabled) || right.updated_at.localeCompare(left.updated_at))[0]
+}
+
+function parseRoute(): DetailRoute {
+  const [, collection, id] = window.location.pathname.split('/')
+  if (collection === 'assets' && id) {
+    return { kind: 'asset', id }
+  }
+  if (collection === 'findings' && id) {
+    return { kind: 'finding', id }
+  }
+  if (collection === 'scans' && id) {
+    return { kind: 'scan', id }
+  }
+  return { kind: 'home' }
 }
 
 export default App
