@@ -56,7 +56,7 @@ impl PostgresRepository {
             r#"
             INSERT INTO users (id, email, display_name, password_hash)
             VALUES ($1, $2, $3, $4)
-            RETURNING id, email, display_name, created_at
+            RETURNING id, email, display_name, email_verified_at, created_at
             "#,
         )
         .bind(id)
@@ -75,7 +75,7 @@ impl PostgresRepository {
     ) -> Result<Option<(UserAccount, String)>, sqlx::Error> {
         let row = sqlx::query(
             r#"
-            SELECT id, email, display_name, password_hash, created_at
+            SELECT id, email, display_name, email_verified_at, password_hash, created_at
             FROM users
             WHERE email = $1
             "#,
@@ -137,6 +137,7 @@ impl PostgresRepository {
                 users.id,
                 users.email,
                 users.display_name,
+                users.email_verified_at,
                 users.created_at AS user_created_at,
                 organization_members.role::text AS role,
                 organization_members.created_at AS membership_created_at
@@ -157,6 +158,7 @@ impl PostgresRepository {
                     id: row.get("id"),
                     email: row.get("email"),
                     display_name: row.get("display_name"),
+                    email_verified_at: row.get("email_verified_at"),
                     created_at: row.get("user_created_at"),
                 },
                 role: parse_member_role(row.get::<&str, _>("role")),
@@ -171,6 +173,7 @@ fn user_from_row(row: &sqlx::postgres::PgRow) -> UserAccount {
         id: row.get("id"),
         email: row.get("email"),
         display_name: row.get("display_name"),
+        email_verified_at: row.get("email_verified_at"),
         created_at: row.get("created_at"),
     }
 }

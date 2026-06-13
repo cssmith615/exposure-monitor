@@ -28,19 +28,27 @@ type SessionState = {
   user: UserAccount
   session: SessionToken
   expires_at?: number
+  refresh_at?: number
 }
 
 type SessionToken = {
   access_token: string
   token_type: string
   expires_in_seconds: number
+  refresh_after_seconds: number
 }
 
 type UserAccount = {
   id: string
   email: string
   display_name: string
+  email_verified_at: string | null
   created_at: string
+}
+
+type AuthMessageResponse = {
+  message: string
+  dev_token: string | null
 }
 
 type Organization = {
@@ -253,10 +261,13 @@ const emptyWorkspace: WorkspaceData = {
 
 function App() {
   const [session, setSession] = useState<SessionState | null>(() => loadStoredSession())
-  const [authMode, setAuthMode] = useState<'login' | 'register'>('login')
+  const [authMode, setAuthMode] = useState<'login' | 'register' | 'reset' | 'verify'>('login')
   const [authEmail, setAuthEmail] = useState('chris@example.com')
   const [authName, setAuthName] = useState('Chris Smith')
   const [authPassword, setAuthPassword] = useState('correct-horse-7!')
+  const [newPassword, setNewPassword] = useState('correct-horse-8!')
+  const [authToken, setAuthToken] = useState('')
+  const [authMessage, setAuthMessage] = useState('')
   const [organizations, setOrganizations] = useState<OrganizationSummary[]>([])
   const [activeOrganizationId, setActiveOrganizationId] = useState<string>('')
   const [workspace, setWorkspace] = useState<WorkspaceData>(emptyWorkspace)
@@ -331,6 +342,16 @@ function App() {
     [session],
   )
 
+  const persistSession = useCallback((nextSession: { user: UserAccount; session: SessionToken }) => {
+    const enrichedSession = {
+      ...nextSession,
+      expires_at: Date.now() + nextSession.session.expires_in_seconds * 1000,
+      refresh_at: Date.now() + nextSession.session.refresh_after_seconds * 1000,
+    }
+    localStorage.setItem(sessionStorageKey, JSON.stringify(enrichedSession))
+    setSession(enrichedSession)
+  }, [])
+
   const refreshOrganizations = useCallback(async () => {
     if (!session) {
       return
@@ -403,6 +424,19 @@ function App() {
   }, [refreshWorkspace])
 
   useEffect(() => {
+    if (!session?.refresh_at) {
+      return
+    }
+    const refreshDelay = Math.max(5_000, session.refresh_at - Date.now())
+    const timeout = window.setTimeout(() => {
+      api<{ user: UserAccount; session: SessionToken }>('/v1/auth/refresh', { method: 'POST' })
+        .then(persistSession)
+        .catch((caught) => setError(errorMessage(caught)))
+    }, refreshDelay)
+    return () => window.clearTimeout(timeout)
+  }, [api, persistSession, session])
+
+  useEffect(() => {
     const onPopState = () => setRoute(parseRoute())
     window.addEventListener('popstate', onPopState)
     return () => window.removeEventListener('popstate', onPopState)
@@ -466,8 +500,12 @@ function App() {
 
   async function submitAuth(event: FormEvent<HTMLFormElement>) {
     event.preventDefault()
+    if (authMode !== 'login' && authMode !== 'register') {
+      return
+    }
     setIsLoading(true)
     setError(null)
+    setAuthMessage('')
     try {
       const nextSession =
         authMode === 'login'
@@ -483,12 +521,11 @@ function App() {
                 password: authPassword,
               }),
             })
-      const enrichedSession = {
-        ...nextSession,
-        expires_at: Date.now() + nextSession.session.expires_in_seconds * 1000,
+      persistSession(nextSession)
+      if ('dev_email_verification_token' in nextSession && nextSession.dev_email_verification_token) {
+        setAuthToken(nextSession.dev_email_verification_token as string)
+        setAuthMessage('Dev verification token generated for this new account.')
       }
-      localStorage.setItem(sessionStorageKey, JSON.stringify(enrichedSession))
-      setSession(enrichedSession)
     } catch (caught) {
       setError(errorMessage(caught))
     } finally {
@@ -501,13 +538,7 @@ function App() {
     setError(null)
     try {
       const response = await api<DevSeedResponse>('/v1/dev/seed', { method: 'POST' })
-      const enrichedSession = {
-        user: response.user,
-        session: response.session,
-        expires_at: Date.now() + response.session.expires_in_seconds * 1000,
-      }
-      localStorage.setItem(sessionStorageKey, JSON.stringify(enrichedSession))
-      setSession(enrichedSession)
+      persistSession({ user: response.user, session: response.session })
       setActiveOrganizationId(response.organization.id)
       navigateTo(`/assets/${response.asset.id}`)
     } catch (caught) {
@@ -515,6 +546,57 @@ function App() {
     } finally {
       setIsLoading(false)
     }
+  }
+
+  async function requestPasswordReset(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault()
+    await mutate(async () => {
+      const response = await api<AuthMessageResponse>('/v1/auth/password-reset/request', {
+        method: 'POST',
+        body: JSON.stringify({ email: authEmail }),
+      })
+      setAuthMessage(response.message)
+      setAuthToken(response.dev_token ?? '')
+    })
+  }
+
+  async function confirmPasswordReset(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault()
+    await mutate(async () => {
+      const response = await api<AuthMessageResponse>('/v1/auth/password-reset/confirm', {
+        method: 'POST',
+        body: JSON.stringify({ token: authToken, new_password: newPassword }),
+      })
+      setAuthMessage(response.message)
+      setAuthPassword(newPassword)
+      setAuthToken('')
+      setAuthMode('login')
+    })
+  }
+
+  async function requestEmailVerification(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault()
+    await mutate(async () => {
+      const response = await api<AuthMessageResponse>('/v1/auth/email-verification/request', {
+        method: 'POST',
+        body: JSON.stringify({ email: authEmail }),
+      })
+      setAuthMessage(response.message)
+      setAuthToken(response.dev_token ?? '')
+    })
+  }
+
+  async function confirmEmailVerification(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault()
+    await mutate(async () => {
+      const response = await api<AuthMessageResponse>('/v1/auth/email-verification/confirm', {
+        method: 'POST',
+        body: JSON.stringify({ token: authToken }),
+      })
+      setAuthMessage(response.message)
+      setAuthToken('')
+      setAuthMode('login')
+    })
   }
 
   async function createOrganization(event: FormEvent<HTMLFormElement>) {
@@ -750,6 +832,9 @@ function App() {
   }
 
   function logout() {
+    if (session) {
+      api('/v1/auth/logout', { method: 'POST' }).catch(() => undefined)
+    }
     clearSession()
   }
 
@@ -782,43 +867,108 @@ function App() {
               <span>Continuous external exposure monitor</span>
             </div>
           </div>
-          <form className="auth-form" onSubmit={submitAuth}>
-            <h1>{authMode === 'login' ? 'Sign in' : 'Create operator'}</h1>
-            {error && <p className="error-banner">{error}</p>}
-            {authMode === 'register' && (
+          {(authMode === 'login' || authMode === 'register') && (
+            <form className="auth-form" onSubmit={submitAuth}>
+              <h1>{authMode === 'login' ? 'Sign in' : 'Create operator'}</h1>
+              {error && <p className="error-banner">{error}</p>}
+              {authMessage && <p className="loading-banner">{authMessage}</p>}
+              {authMode === 'register' && (
+                <label>
+                  Display name
+                  <input value={authName} onChange={(event) => setAuthName(event.target.value)} />
+                </label>
+              )}
               <label>
-                Display name
-                <input value={authName} onChange={(event) => setAuthName(event.target.value)} />
+                Email
+                <input value={authEmail} onChange={(event) => setAuthEmail(event.target.value)} />
               </label>
-            )}
-            <label>
-              Email
-              <input value={authEmail} onChange={(event) => setAuthEmail(event.target.value)} />
-            </label>
-            <label>
-              Password
-              <input
-                type="password"
-                value={authPassword}
-                onChange={(event) => setAuthPassword(event.target.value)}
-              />
-            </label>
-            <button disabled={isLoading} type="submit">
-              <LockKeyhole size={18} aria-hidden="true" />
-              {authMode === 'login' ? 'Login' : 'Register'}
-            </button>
-            <button
-              className="secondary"
-              type="button"
-              onClick={() => setAuthMode(authMode === 'login' ? 'register' : 'login')}
-            >
-              {authMode === 'login' ? 'Need an account?' : 'Already registered?'}
-            </button>
-            <button className="secondary" disabled={isLoading} type="button" onClick={seedDevWorkspace}>
-              <Radar size={18} aria-hidden="true" />
-              Load dev workspace
-            </button>
-          </form>
+              <label>
+                Password
+                <input
+                  type="password"
+                  value={authPassword}
+                  onChange={(event) => setAuthPassword(event.target.value)}
+                />
+              </label>
+              <button disabled={isLoading} type="submit">
+                <LockKeyhole size={18} aria-hidden="true" />
+                {authMode === 'login' ? 'Login' : 'Register'}
+              </button>
+              <button
+                className="secondary"
+                type="button"
+                onClick={() => setAuthMode(authMode === 'login' ? 'register' : 'login')}
+              >
+                {authMode === 'login' ? 'Need an account?' : 'Already registered?'}
+              </button>
+              <div className="auth-link-row">
+                <button className="text-link" type="button" onClick={() => setAuthMode('reset')}>
+                  Reset password
+                </button>
+                <button className="text-link" type="button" onClick={() => setAuthMode('verify')}>
+                  Verify email
+                </button>
+              </div>
+              <button className="secondary" disabled={isLoading} type="button" onClick={seedDevWorkspace}>
+                <Radar size={18} aria-hidden="true" />
+                Load dev workspace
+              </button>
+            </form>
+          )}
+
+          {authMode === 'reset' && (
+            <form className="auth-form" onSubmit={authToken ? confirmPasswordReset : requestPasswordReset}>
+              <h1>Password reset</h1>
+              {error && <p className="error-banner">{error}</p>}
+              {authMessage && <p className="loading-banner">{authMessage}</p>}
+              <label>
+                Email
+                <input value={authEmail} onChange={(event) => setAuthEmail(event.target.value)} />
+              </label>
+              <label>
+                Reset token
+                <input value={authToken} onChange={(event) => setAuthToken(event.target.value)} />
+              </label>
+              <label>
+                New password
+                <input
+                  type="password"
+                  value={newPassword}
+                  onChange={(event) => setNewPassword(event.target.value)}
+                />
+              </label>
+              <button disabled={isLoading} type="submit">
+                <LockKeyhole size={18} aria-hidden="true" />
+                {authToken ? 'Reset password' : 'Request reset'}
+              </button>
+              <button className="secondary" type="button" onClick={() => setAuthMode('login')}>
+                Back to login
+              </button>
+            </form>
+          )}
+
+          {authMode === 'verify' && (
+            <form className="auth-form" onSubmit={authToken ? confirmEmailVerification : requestEmailVerification}>
+              <h1>Verify email</h1>
+              {error && <p className="error-banner">{error}</p>}
+              {authMessage && <p className="loading-banner">{authMessage}</p>}
+              <label>
+                Email
+                <input value={authEmail} onChange={(event) => setAuthEmail(event.target.value)} />
+              </label>
+              <label>
+                Verification token
+                <input value={authToken} onChange={(event) => setAuthToken(event.target.value)} />
+              </label>
+              <button disabled={isLoading} type="submit">
+                <LockKeyhole size={18} aria-hidden="true" />
+                {authToken ? 'Verify email' : 'Request verification'}
+              </button>
+              <button className="secondary" type="button" onClick={() => setAuthMode('login')}>
+                Back to login
+              </button>
+            </form>
+          )}
         </section>
       </main>
     )

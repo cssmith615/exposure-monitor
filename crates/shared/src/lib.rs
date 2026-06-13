@@ -206,6 +206,7 @@ pub struct UserAccount {
     pub id: Uuid,
     pub email: String,
     pub display_name: String,
+    pub email_verified_at: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
 }
 
@@ -258,6 +259,8 @@ pub struct RegisterUserRequest {
 pub struct RegisterUserResponse {
     pub user: UserAccount,
     pub session: SessionToken,
+    pub email_verification_required: bool,
+    pub dev_email_verification_token: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -277,6 +280,45 @@ pub struct SessionToken {
     pub access_token: String,
     pub token_type: String,
     pub expires_in_seconds: i64,
+    pub refresh_after_seconds: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RefreshSessionResponse {
+    pub user: UserAccount,
+    pub session: SessionToken,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LogoutResponse {
+    pub revoked: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AuthMessageResponse {
+    pub message: String,
+    pub dev_token: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RequestPasswordResetRequest {
+    pub email: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ResetPasswordRequest {
+    pub token: String,
+    pub new_password: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RequestEmailVerificationRequest {
+    pub email: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct VerifyEmailRequest {
+    pub token: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

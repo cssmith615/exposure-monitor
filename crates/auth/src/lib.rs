@@ -48,7 +48,14 @@ pub enum AuthError {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SessionClaims {
     pub sub: String,
+    pub jti: String,
     pub exp: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VerifiedSessionToken {
+    pub user_id: Uuid,
+    pub session_id: Uuid,
 }
 
 pub fn validate_password_policy(
@@ -92,12 +99,14 @@ pub fn verify_password(password: &str, password_hash: &str) -> Result<bool, Auth
 
 pub fn issue_session_token(
     user_id: Uuid,
+    session_id: Uuid,
     secret: &[u8],
     ttl_seconds: i64,
 ) -> Result<String, AuthError> {
     let expires_at = Utc::now() + Duration::seconds(ttl_seconds);
     let claims = SessionClaims {
         sub: user_id.to_string(),
+        jti: session_id.to_string(),
         exp: expires_at.timestamp() as usize,
     };
 
@@ -109,7 +118,7 @@ pub fn issue_session_token(
     .map_err(|_| AuthError::SessionToken)
 }
 
-pub fn verify_session_token(token: &str, secret: &[u8]) -> Result<Uuid, AuthError> {
+pub fn verify_session_token(token: &str, secret: &[u8]) -> Result<VerifiedSessionToken, AuthError> {
     let token_data = decode::<SessionClaims>(
         token,
         &DecodingKey::from_secret(secret),
@@ -117,7 +126,10 @@ pub fn verify_session_token(token: &str, secret: &[u8]) -> Result<Uuid, AuthErro
     )
     .map_err(|_| AuthError::SessionToken)?;
 
-    Uuid::parse_str(&token_data.claims.sub).map_err(|_| AuthError::SessionToken)
+    Ok(VerifiedSessionToken {
+        user_id: Uuid::parse_str(&token_data.claims.sub).map_err(|_| AuthError::SessionToken)?,
+        session_id: Uuid::parse_str(&token_data.claims.jti).map_err(|_| AuthError::SessionToken)?,
+    })
 }
 
 #[cfg(test)]
@@ -148,11 +160,11 @@ mod tests {
     #[test]
     fn issues_and_verifies_session_token() {
         let user_id = Uuid::now_v7();
-        let token = issue_session_token(user_id, b"test-secret", 3600).unwrap();
+        let session_id = Uuid::now_v7();
+        let token = issue_session_token(user_id, session_id, b"test-secret", 3600).unwrap();
+        let verified = verify_session_token(&token, b"test-secret").unwrap();
 
-        assert_eq!(
-            verify_session_token(&token, b"test-secret").unwrap(),
-            user_id
-        );
+        assert_eq!(verified.user_id, user_id);
+        assert_eq!(verified.session_id, session_id);
     }
 }

@@ -1,8 +1,3 @@
-use std::{
-    collections::{HashMap, VecDeque},
-    sync::{Mutex, OnceLock},
-};
-
 use axum::{
     Json, Router,
     extract::{FromRef, Path, State},
@@ -20,26 +15,29 @@ use ceem_findings::derive_findings_from_scan_result;
 use ceem_scanner::{collect_dns_policy_baseline, probe_http_endpoint, resolve_dns_baseline};
 use ceem_shared::{
     AcceptOrganizationInviteResponse, Alert, AlertSettingsResponse, AlertStatus, AuditLog,
-    Confidence, CreateDomainAssetRequest, CreateDomainAssetResponse, CreateFindingNoteRequest,
-    CreateFindingNoteResponse, CreateOrganizationInviteRequest, CreateOrganizationInviteResponse,
-    CreateOrganizationRequest, CreateOrganizationResponse, CreateRemediationTaskRequest,
-    CreateRemediationTaskResponse, CreateScanJobRequest, CreateScanJobResponse,
-    CreateScheduledScanRequest, CreateSlackChannelRequest, CreateSlackChannelResponse,
-    DeriveFindingsResponse, DevSeedResponse, DomainAsset, Finding, FindingEvent, FindingStatus,
-    HealthResponse, LoginRequest, LoginResponse, MemberRole, Organization,
-    OrganizationAlertSettings, OrganizationInvite, OrganizationMember, OrganizationMembership,
-    OrganizationSummary, PRODUCT_NAME, QueueSlackAlertResponse, RegisterUserRequest,
-    RegisterUserResponse, RemediationStatus, RemediationTask, RunDnsBaselineScanResponse,
-    ScanCadence, ScanEvidence, ScanJob, ScanProfile, ScanResult, ScanStatus, ScheduledScan,
-    ScheduledScanResponse, ServiceStatus, SessionToken, Severity, SlackNotificationChannel,
-    UpdateAlertSettingsRequest, UpdateFindingStatusRequest, UpdateFindingStatusResponse,
-    UpdateMemberRoleRequest, UpdateMemberRoleResponse, UpdateRemediationStatusRequest,
-    UpdateRemediationStatusResponse, UpdateScheduledScanRequest, UserAccount,
-    calculate_finding_risk_score, finding_risk_factors, validate_domain, validate_slug,
+    AuthMessageResponse, Confidence, CreateDomainAssetRequest, CreateDomainAssetResponse,
+    CreateFindingNoteRequest, CreateFindingNoteResponse, CreateOrganizationInviteRequest,
+    CreateOrganizationInviteResponse, CreateOrganizationRequest, CreateOrganizationResponse,
+    CreateRemediationTaskRequest, CreateRemediationTaskResponse, CreateScanJobRequest,
+    CreateScanJobResponse, CreateScheduledScanRequest, CreateSlackChannelRequest,
+    CreateSlackChannelResponse, DeriveFindingsResponse, DevSeedResponse, DomainAsset, Finding,
+    FindingEvent, FindingStatus, HealthResponse, LoginRequest, LoginResponse, LogoutResponse,
+    MemberRole, Organization, OrganizationAlertSettings, OrganizationInvite, OrganizationMember,
+    OrganizationMembership, OrganizationSummary, PRODUCT_NAME, QueueSlackAlertResponse,
+    RefreshSessionResponse, RegisterUserRequest, RegisterUserResponse, RemediationStatus,
+    RemediationTask, RequestEmailVerificationRequest, RequestPasswordResetRequest,
+    ResetPasswordRequest, RunDnsBaselineScanResponse, ScanCadence, ScanEvidence, ScanJob,
+    ScanProfile, ScanResult, ScanStatus, ScheduledScan, ScheduledScanResponse, ServiceStatus,
+    SessionToken, Severity, SlackNotificationChannel, UpdateAlertSettingsRequest,
+    UpdateFindingStatusRequest, UpdateFindingStatusResponse, UpdateMemberRoleRequest,
+    UpdateMemberRoleResponse, UpdateRemediationStatusRequest, UpdateRemediationStatusResponse,
+    UpdateScheduledScanRequest, UserAccount, VerifyEmailRequest, calculate_finding_risk_score,
+    finding_risk_factors, validate_domain, validate_slug,
 };
 use chrono::{Duration, Utc};
 use serde::Serialize;
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use sqlx::{PgPool, Row, postgres::PgRow};
 use tower_http::{
     cors::{Any, CorsLayer},
@@ -73,6 +71,24 @@ fn app(pool: PgPool) -> Router {
         .route("/v1/dev/seed", post(seed_dev_workspace))
         .route("/v1/auth/register", post(register_user))
         .route("/v1/auth/login", post(login_user))
+        .route("/v1/auth/logout", post(logout_user))
+        .route("/v1/auth/refresh", post(refresh_session))
+        .route(
+            "/v1/auth/password-reset/request",
+            post(request_password_reset),
+        )
+        .route(
+            "/v1/auth/password-reset/confirm",
+            post(confirm_password_reset),
+        )
+        .route(
+            "/v1/auth/email-verification/request",
+            post(request_email_verification),
+        )
+        .route(
+            "/v1/auth/email-verification/confirm",
+            post(confirm_email_verification),
+        )
         .route(
             "/v1/organizations",
             post(create_organization).get(list_organizations),
@@ -233,6 +249,12 @@ struct AppState {
     pool: PgPool,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct AuthenticatedSession {
+    user_id: Uuid,
+    session_id: Uuid,
+}
+
 impl FromRef<AppState> for PgPool {
     fn from_ref(state: &AppState) -> Self {
         state.pool.clone()
@@ -254,7 +276,7 @@ async fn seed_dev_workspace(State(pool): State<PgPool>) -> Result<Json<DevSeedRe
             r#"
             INSERT INTO users (id, email, display_name, password_hash)
             VALUES ($1, $2, $3, $4)
-            RETURNING id, email, display_name, created_at
+            RETURNING id, email, display_name, email_verified_at, created_at
             "#,
         )
         .bind(Uuid::now_v7())
@@ -342,7 +364,15 @@ async fn seed_dev_workspace(State(pool): State<PgPool>) -> Result<Json<DevSeedRe
         json!({ "asset_id": asset.id }),
     )
     .await?;
-    let session = session_for_user(user.id)?;
+    sqlx::query(
+        "UPDATE users SET email_verified_at = COALESCE(email_verified_at, now()) WHERE id = $1",
+    )
+    .bind(user.id)
+    .execute(&pool)
+    .await
+    .map_err(map_sql_error)?;
+    let user = require_user(&pool, user.id).await?;
+    let session = session_for_user(&pool, user.id).await?;
 
     Ok(Json(DevSeedResponse {
         user,
@@ -359,7 +389,7 @@ async fn register_user(
     Json(request): Json<RegisterUserRequest>,
 ) -> Result<Json<RegisterUserResponse>, ApiError> {
     let email = normalize_email(&request.email)?;
-    enforce_auth_rate_limit(&email)?;
+    enforce_auth_rate_limit(&pool, "register", &email, 60, 8).await?;
     let display_name = validate_display_name(&request.display_name)?;
     validate_password_policy(&request.password, &PasswordPolicy::default())
         .map_err(|error| ApiError::bad_request(error.to_string()))?;
@@ -373,7 +403,7 @@ async fn register_user(
         r#"
         INSERT INTO users (id, email, display_name, password_hash)
         VALUES ($1, $2, $3, $4)
-        RETURNING id, email, display_name, created_at
+        RETURNING id, email, display_name, email_verified_at, created_at
         "#,
     )
     .bind(Uuid::now_v7())
@@ -385,7 +415,8 @@ async fn register_user(
     .map_err(map_sql_error)?;
 
     let user = user_from_row(&row);
-    let session = session_for_user(user.id)?;
+    let verification_token = create_email_verification_token(&pool, user.id).await?;
+    let session = session_for_user(&pool, user.id).await?;
     record_audit(
         &pool,
         None,
@@ -397,7 +428,12 @@ async fn register_user(
     )
     .await?;
 
-    Ok(Json(RegisterUserResponse { user, session }))
+    Ok(Json(RegisterUserResponse {
+        user,
+        session,
+        email_verification_required: true,
+        dev_email_verification_token: dev_visible_token(verification_token),
+    }))
 }
 
 async fn login_user(
@@ -405,7 +441,7 @@ async fn login_user(
     Json(request): Json<LoginRequest>,
 ) -> Result<Json<LoginResponse>, ApiError> {
     let email = normalize_email(&request.email)?;
-    enforce_auth_rate_limit(&email)?;
+    enforce_auth_rate_limit(&pool, "login", &email, 60, 8).await?;
     let (user, password_hash) = find_user_by_email(&pool, &email)
         .await?
         .ok_or_else(|| ApiError::unauthorized("email or password is incorrect"))?;
@@ -413,8 +449,13 @@ async fn login_user(
     if !verify_password(&request.password, &password_hash).map_err(|_| ApiError::internal())? {
         return Err(ApiError::unauthorized("email or password is incorrect"));
     }
+    if user.email_verified_at.is_none() {
+        return Err(ApiError::forbidden(
+            "email verification is required before login",
+        ));
+    }
 
-    let session = session_for_user(user.id)?;
+    let session = session_for_user(&pool, user.id).await?;
     record_audit(
         &pool,
         None,
@@ -429,12 +470,229 @@ async fn login_user(
     Ok(Json(LoginResponse { user, session }))
 }
 
+async fn logout_user(
+    State(pool): State<PgPool>,
+    headers: HeaderMap,
+) -> Result<Json<LogoutResponse>, ApiError> {
+    let session = current_session(&pool, &headers).await?;
+    sqlx::query("UPDATE sessions SET revoked_at = now() WHERE id = $1 AND revoked_at IS NULL")
+        .bind(session.session_id)
+        .execute(&pool)
+        .await
+        .map_err(map_sql_error)?;
+    record_audit(
+        &pool,
+        None,
+        Some(session.user_id),
+        "auth.logout",
+        "session",
+        Some(session.session_id),
+        json!({}),
+    )
+    .await?;
+
+    Ok(Json(LogoutResponse { revoked: true }))
+}
+
+async fn refresh_session(
+    State(pool): State<PgPool>,
+    headers: HeaderMap,
+) -> Result<Json<RefreshSessionResponse>, ApiError> {
+    let session = current_session(&pool, &headers).await?;
+    sqlx::query("UPDATE sessions SET revoked_at = now() WHERE id = $1 AND revoked_at IS NULL")
+        .bind(session.session_id)
+        .execute(&pool)
+        .await
+        .map_err(map_sql_error)?;
+    let user = require_user(&pool, session.user_id).await?;
+    let session_token = session_for_user(&pool, user.id).await?;
+    record_audit(
+        &pool,
+        None,
+        Some(user.id),
+        "auth.session_refreshed",
+        "session",
+        None,
+        json!({ "previous_session_id": session.session_id }),
+    )
+    .await?;
+
+    Ok(Json(RefreshSessionResponse {
+        user,
+        session: session_token,
+    }))
+}
+
+async fn request_password_reset(
+    State(pool): State<PgPool>,
+    Json(request): Json<RequestPasswordResetRequest>,
+) -> Result<Json<AuthMessageResponse>, ApiError> {
+    let email = normalize_email(&request.email)?;
+    enforce_auth_rate_limit(&pool, "password_reset_request", &email, 60, 5).await?;
+    let token = if let Some((user, _)) = find_user_by_email(&pool, &email).await? {
+        let token = create_password_reset_token(&pool, user.id).await?;
+        record_audit(
+            &pool,
+            None,
+            Some(user.id),
+            "auth.password_reset_requested",
+            "user",
+            Some(user.id),
+            json!({ "email": user.email }),
+        )
+        .await?;
+        dev_visible_token(token)
+    } else {
+        None
+    };
+
+    Ok(Json(AuthMessageResponse {
+        message: "If that email exists, password reset instructions have been queued.".to_string(),
+        dev_token: token,
+    }))
+}
+
+async fn confirm_password_reset(
+    State(pool): State<PgPool>,
+    Json(request): Json<ResetPasswordRequest>,
+) -> Result<Json<AuthMessageResponse>, ApiError> {
+    validate_password_policy(&request.new_password, &PasswordPolicy::default())
+        .map_err(|error| ApiError::bad_request(error.to_string()))?;
+    let token_hash = hash_token(&request.token);
+    let mut transaction = pool.begin().await.map_err(map_sql_error)?;
+    let row = sqlx::query(
+        r#"
+        UPDATE password_reset_tokens
+        SET consumed_at = now()
+        WHERE token_hash = $1 AND consumed_at IS NULL AND expires_at > now()
+        RETURNING user_id
+        "#,
+    )
+    .bind(token_hash)
+    .fetch_optional(&mut *transaction)
+    .await
+    .map_err(map_sql_error)?
+    .ok_or_else(|| ApiError::bad_request("password reset token is invalid or expired"))?;
+    let user_id: Uuid = row.get("user_id");
+    let password_hash = hash_password(&request.new_password).map_err(|_| ApiError::internal())?;
+    sqlx::query(
+        r#"
+        UPDATE users
+        SET password_hash = $2, password_changed_at = now(), updated_at = now()
+        WHERE id = $1
+        "#,
+    )
+    .bind(user_id)
+    .bind(password_hash)
+    .execute(&mut *transaction)
+    .await
+    .map_err(map_sql_error)?;
+    sqlx::query("UPDATE sessions SET revoked_at = now() WHERE user_id = $1 AND revoked_at IS NULL")
+        .bind(user_id)
+        .execute(&mut *transaction)
+        .await
+        .map_err(map_sql_error)?;
+    transaction.commit().await.map_err(map_sql_error)?;
+    record_audit(
+        &pool,
+        None,
+        Some(user_id),
+        "auth.password_reset_completed",
+        "user",
+        Some(user_id),
+        json!({ "sessions_revoked": true }),
+    )
+    .await?;
+
+    Ok(Json(AuthMessageResponse {
+        message: "Password reset complete. Existing sessions were revoked.".to_string(),
+        dev_token: None,
+    }))
+}
+
+async fn request_email_verification(
+    State(pool): State<PgPool>,
+    Json(request): Json<RequestEmailVerificationRequest>,
+) -> Result<Json<AuthMessageResponse>, ApiError> {
+    let email = normalize_email(&request.email)?;
+    enforce_auth_rate_limit(&pool, "email_verification_request", &email, 60, 5).await?;
+    let token = if let Some((user, _)) = find_user_by_email(&pool, &email).await? {
+        if user.email_verified_at.is_some() {
+            None
+        } else {
+            let token = create_email_verification_token(&pool, user.id).await?;
+            record_audit(
+                &pool,
+                None,
+                Some(user.id),
+                "auth.email_verification_requested",
+                "user",
+                Some(user.id),
+                json!({ "email": user.email }),
+            )
+            .await?;
+            dev_visible_token(token)
+        }
+    } else {
+        None
+    };
+
+    Ok(Json(AuthMessageResponse {
+        message: "If verification is needed, email verification instructions have been queued."
+            .to_string(),
+        dev_token: token,
+    }))
+}
+
+async fn confirm_email_verification(
+    State(pool): State<PgPool>,
+    Json(request): Json<VerifyEmailRequest>,
+) -> Result<Json<AuthMessageResponse>, ApiError> {
+    let token_hash = hash_token(&request.token);
+    let mut transaction = pool.begin().await.map_err(map_sql_error)?;
+    let row = sqlx::query(
+        r#"
+        UPDATE email_verification_tokens
+        SET consumed_at = now()
+        WHERE token_hash = $1 AND consumed_at IS NULL AND expires_at > now()
+        RETURNING user_id
+        "#,
+    )
+    .bind(token_hash)
+    .fetch_optional(&mut *transaction)
+    .await
+    .map_err(map_sql_error)?
+    .ok_or_else(|| ApiError::bad_request("email verification token is invalid or expired"))?;
+    let user_id: Uuid = row.get("user_id");
+    sqlx::query("UPDATE users SET email_verified_at = COALESCE(email_verified_at, now()), updated_at = now() WHERE id = $1")
+        .bind(user_id)
+        .execute(&mut *transaction)
+        .await
+        .map_err(map_sql_error)?;
+    transaction.commit().await.map_err(map_sql_error)?;
+    record_audit(
+        &pool,
+        None,
+        Some(user_id),
+        "auth.email_verified",
+        "user",
+        Some(user_id),
+        json!({}),
+    )
+    .await?;
+
+    Ok(Json(AuthMessageResponse {
+        message: "Email verification complete.".to_string(),
+        dev_token: None,
+    }))
+}
+
 async fn create_organization(
     State(pool): State<PgPool>,
     headers: HeaderMap,
     Json(request): Json<CreateOrganizationRequest>,
 ) -> Result<Json<CreateOrganizationResponse>, ApiError> {
-    let user_id = current_user_id(&headers)?;
+    let user_id = current_user_id(&pool, &headers).await?;
     require_user(&pool, user_id).await?;
     let name = validate_organization_name(&request.name)?;
     let slug =
@@ -485,7 +743,7 @@ async fn list_organizations(
     State(pool): State<PgPool>,
     headers: HeaderMap,
 ) -> Result<Json<Vec<OrganizationSummary>>, ApiError> {
-    let user_id = current_user_id(&headers)?;
+    let user_id = current_user_id(&pool, &headers).await?;
     require_user(&pool, user_id).await?;
     let rows = sqlx::query(
         r#"
@@ -521,7 +779,7 @@ async fn list_organization_members(
     headers: HeaderMap,
     Path(organization_id): Path<Uuid>,
 ) -> Result<Json<Vec<OrganizationMember>>, ApiError> {
-    let user_id = current_user_id(&headers)?;
+    let user_id = current_user_id(&pool, &headers).await?;
     require_membership(&pool, user_id, organization_id).await?;
     Ok(Json(list_members(&pool, organization_id).await?))
 }
@@ -532,7 +790,7 @@ async fn create_organization_invite(
     Path(organization_id): Path<Uuid>,
     Json(request): Json<CreateOrganizationInviteRequest>,
 ) -> Result<Json<CreateOrganizationInviteResponse>, ApiError> {
-    let user_id = current_user_id(&headers)?;
+    let user_id = current_user_id(&pool, &headers).await?;
     let role = require_membership(&pool, user_id, organization_id).await?;
     if !matches!(role, MemberRole::Owner | MemberRole::Admin) {
         return Err(ApiError::forbidden(
@@ -585,7 +843,7 @@ async fn accept_organization_invite(
     headers: HeaderMap,
     Path(token): Path<String>,
 ) -> Result<Json<AcceptOrganizationInviteResponse>, ApiError> {
-    let user_id = current_user_id(&headers)?;
+    let user_id = current_user_id(&pool, &headers).await?;
     let user = require_user(&pool, user_id).await?;
     let row = sqlx::query(
         r#"
@@ -663,7 +921,7 @@ async fn update_member_role(
     Path((organization_id, member_user_id)): Path<(Uuid, Uuid)>,
     Json(request): Json<UpdateMemberRoleRequest>,
 ) -> Result<Json<UpdateMemberRoleResponse>, ApiError> {
-    let user_id = current_user_id(&headers)?;
+    let user_id = current_user_id(&pool, &headers).await?;
     let actor_role = require_membership(&pool, user_id, organization_id).await?;
     if !matches!(actor_role, MemberRole::Owner | MemberRole::Admin) {
         return Err(ApiError::forbidden(
@@ -712,7 +970,7 @@ async fn create_domain_asset(
     Path(organization_id): Path<Uuid>,
     Json(request): Json<CreateDomainAssetRequest>,
 ) -> Result<Json<CreateDomainAssetResponse>, ApiError> {
-    let user_id = current_user_id(&headers)?;
+    let user_id = current_user_id(&pool, &headers).await?;
     if !request.authorization_attested {
         return Err(ApiError::bad_request(
             "authorization attestation is required before adding a domain",
@@ -764,7 +1022,7 @@ async fn list_domain_assets(
     headers: HeaderMap,
     Path(organization_id): Path<Uuid>,
 ) -> Result<Json<Vec<DomainAsset>>, ApiError> {
-    let user_id = current_user_id(&headers)?;
+    let user_id = current_user_id(&pool, &headers).await?;
     require_membership(&pool, user_id, organization_id).await?;
     let rows = sqlx::query(
         r#"
@@ -789,7 +1047,7 @@ async fn create_scan_job(
     Path((organization_id, asset_id)): Path<(Uuid, Uuid)>,
     Json(request): Json<CreateScanJobRequest>,
 ) -> Result<Json<CreateScanJobResponse>, ApiError> {
-    let user_id = current_user_id(&headers)?;
+    let user_id = current_user_id(&pool, &headers).await?;
     let role = require_membership(&pool, user_id, organization_id).await?;
     if matches!(role, MemberRole::Viewer) {
         return Err(ApiError::forbidden(
@@ -836,7 +1094,7 @@ async fn list_scan_jobs(
     headers: HeaderMap,
     Path(organization_id): Path<Uuid>,
 ) -> Result<Json<Vec<ScanJob>>, ApiError> {
-    let user_id = current_user_id(&headers)?;
+    let user_id = current_user_id(&pool, &headers).await?;
     require_membership(&pool, user_id, organization_id).await?;
     let rows = sqlx::query(
         r#"
@@ -860,7 +1118,7 @@ async fn list_scheduled_scans(
     headers: HeaderMap,
     Path(organization_id): Path<Uuid>,
 ) -> Result<Json<Vec<ScheduledScan>>, ApiError> {
-    let user_id = current_user_id(&headers)?;
+    let user_id = current_user_id(&pool, &headers).await?;
     require_membership(&pool, user_id, organization_id).await?;
     let rows = sqlx::query(
         r#"
@@ -885,7 +1143,7 @@ async fn create_scheduled_scan(
     Path((organization_id, asset_id)): Path<(Uuid, Uuid)>,
     Json(request): Json<CreateScheduledScanRequest>,
 ) -> Result<Json<ScheduledScanResponse>, ApiError> {
-    let user_id = current_user_id(&headers)?;
+    let user_id = current_user_id(&pool, &headers).await?;
     let role = require_membership(&pool, user_id, organization_id).await?;
     if matches!(role, MemberRole::Viewer) {
         return Err(ApiError::forbidden(
@@ -927,7 +1185,7 @@ async fn update_scheduled_scan(
     Path((organization_id, scheduled_scan_id)): Path<(Uuid, Uuid)>,
     Json(request): Json<UpdateScheduledScanRequest>,
 ) -> Result<Json<ScheduledScanResponse>, ApiError> {
-    let user_id = current_user_id(&headers)?;
+    let user_id = current_user_id(&pool, &headers).await?;
     let role = require_membership(&pool, user_id, organization_id).await?;
     if matches!(role, MemberRole::Viewer) {
         return Err(ApiError::forbidden("viewers cannot update scan schedules"));
@@ -984,7 +1242,7 @@ async fn pause_scheduled_scan(
     headers: HeaderMap,
     Path((organization_id, scheduled_scan_id)): Path<(Uuid, Uuid)>,
 ) -> Result<Json<ScheduledScanResponse>, ApiError> {
-    let user_id = current_user_id(&headers)?;
+    let user_id = current_user_id(&pool, &headers).await?;
     let role = require_membership(&pool, user_id, organization_id).await?;
     if matches!(role, MemberRole::Viewer) {
         return Err(ApiError::forbidden("viewers cannot pause scan schedules"));
@@ -1050,7 +1308,7 @@ async fn run_scan_now(
     scan_job_id: Uuid,
     source: &str,
 ) -> Result<Json<RunDnsBaselineScanResponse>, ApiError> {
-    let user_id = current_user_id(&headers)?;
+    let user_id = current_user_id(&pool, &headers).await?;
     let (asset_id, domain) =
         claim_scan_job_asset(&pool, user_id, organization_id, scan_job_id, source).await?;
     let evidence = match source {
@@ -1098,7 +1356,7 @@ async fn list_scan_results(
     headers: HeaderMap,
     Path(organization_id): Path<Uuid>,
 ) -> Result<Json<Vec<ScanResult>>, ApiError> {
-    let user_id = current_user_id(&headers)?;
+    let user_id = current_user_id(&pool, &headers).await?;
     require_membership(&pool, user_id, organization_id).await?;
     let rows = sqlx::query(
         r#"
@@ -1127,7 +1385,7 @@ async fn derive_findings(
     headers: HeaderMap,
     Path((organization_id, scan_result_id)): Path<(Uuid, Uuid)>,
 ) -> Result<Json<DeriveFindingsResponse>, ApiError> {
-    let user_id = current_user_id(&headers)?;
+    let user_id = current_user_id(&pool, &headers).await?;
     require_membership(&pool, user_id, organization_id).await?;
     let scan_result = scan_result_by_id(&pool, organization_id, scan_result_id).await?;
     let findings = upsert_findings(&pool, &scan_result).await?;
@@ -1151,7 +1409,7 @@ async fn list_findings(
     headers: HeaderMap,
     Path(organization_id): Path<Uuid>,
 ) -> Result<Json<Vec<Finding>>, ApiError> {
-    let user_id = current_user_id(&headers)?;
+    let user_id = current_user_id(&pool, &headers).await?;
     require_membership(&pool, user_id, organization_id).await?;
     let rows = sqlx::query(
         r#"
@@ -1177,7 +1435,7 @@ async fn update_finding_status(
     Path((organization_id, finding_id)): Path<(Uuid, Uuid)>,
     Json(request): Json<UpdateFindingStatusRequest>,
 ) -> Result<Json<UpdateFindingStatusResponse>, ApiError> {
-    let user_id = current_user_id(&headers)?;
+    let user_id = current_user_id(&pool, &headers).await?;
     require_membership(&pool, user_id, organization_id).await?;
     let note = validate_optional_text(request.note, "note", 1_000)?;
 
@@ -1239,7 +1497,7 @@ async fn create_finding_note(
     Path((organization_id, finding_id)): Path<(Uuid, Uuid)>,
     Json(request): Json<CreateFindingNoteRequest>,
 ) -> Result<Json<CreateFindingNoteResponse>, ApiError> {
-    let user_id = current_user_id(&headers)?;
+    let user_id = current_user_id(&pool, &headers).await?;
     require_membership(&pool, user_id, organization_id).await?;
     require_finding_in_org(&pool, organization_id, finding_id).await?;
     let note = validate_required_note(&request.note)?;
@@ -1272,7 +1530,7 @@ async fn list_finding_notes(
     headers: HeaderMap,
     Path((organization_id, finding_id)): Path<(Uuid, Uuid)>,
 ) -> Result<Json<Vec<FindingEvent>>, ApiError> {
-    let user_id = current_user_id(&headers)?;
+    let user_id = current_user_id(&pool, &headers).await?;
     require_membership(&pool, user_id, organization_id).await?;
     require_finding_in_org(&pool, organization_id, finding_id).await?;
     let rows = sqlx::query(
@@ -1298,7 +1556,7 @@ async fn create_slack_channel(
     Path(organization_id): Path<Uuid>,
     Json(request): Json<CreateSlackChannelRequest>,
 ) -> Result<Json<CreateSlackChannelResponse>, ApiError> {
-    let user_id = current_user_id(&headers)?;
+    let user_id = current_user_id(&pool, &headers).await?;
     let role = require_membership(&pool, user_id, organization_id).await?;
     if !matches!(role, MemberRole::Owner | MemberRole::Admin) {
         return Err(ApiError::forbidden(
@@ -1342,7 +1600,7 @@ async fn queue_slack_alert(
     headers: HeaderMap,
     Path((organization_id, finding_id)): Path<(Uuid, Uuid)>,
 ) -> Result<Json<QueueSlackAlertResponse>, ApiError> {
-    let user_id = current_user_id(&headers)?;
+    let user_id = current_user_id(&pool, &headers).await?;
     require_membership(&pool, user_id, organization_id).await?;
     let finding = require_finding_in_org(&pool, organization_id, finding_id).await?;
     let settings = get_or_create_alert_settings(&pool, organization_id).await?;
@@ -1435,7 +1693,7 @@ async fn get_alert_settings(
     headers: HeaderMap,
     Path(organization_id): Path<Uuid>,
 ) -> Result<Json<AlertSettingsResponse>, ApiError> {
-    let user_id = current_user_id(&headers)?;
+    let user_id = current_user_id(&pool, &headers).await?;
     require_membership(&pool, user_id, organization_id).await?;
     let settings = get_or_create_alert_settings(&pool, organization_id).await?;
     Ok(Json(AlertSettingsResponse { settings }))
@@ -1447,7 +1705,7 @@ async fn update_alert_settings(
     Path(organization_id): Path<Uuid>,
     Json(request): Json<UpdateAlertSettingsRequest>,
 ) -> Result<Json<AlertSettingsResponse>, ApiError> {
-    let user_id = current_user_id(&headers)?;
+    let user_id = current_user_id(&pool, &headers).await?;
     let role = require_membership(&pool, user_id, organization_id).await?;
     if matches!(role, MemberRole::Viewer) {
         return Err(ApiError::forbidden("viewers cannot update alert settings"));
@@ -1486,7 +1744,7 @@ async fn list_alerts(
     headers: HeaderMap,
     Path(organization_id): Path<Uuid>,
 ) -> Result<Json<Vec<Alert>>, ApiError> {
-    let user_id = current_user_id(&headers)?;
+    let user_id = current_user_id(&pool, &headers).await?;
     require_membership(&pool, user_id, organization_id).await?;
     let rows = sqlx::query(
         r#"
@@ -1510,7 +1768,7 @@ async fn deliver_alert(
     headers: HeaderMap,
     Path((organization_id, alert_id)): Path<(Uuid, Uuid)>,
 ) -> Result<Json<QueueSlackAlertResponse>, ApiError> {
-    let user_id = current_user_id(&headers)?;
+    let user_id = current_user_id(&pool, &headers).await?;
     require_membership(&pool, user_id, organization_id).await?;
     let row = sqlx::query(
         r#"
@@ -1589,7 +1847,7 @@ async fn retry_alert(
     headers: HeaderMap,
     Path((organization_id, alert_id)): Path<(Uuid, Uuid)>,
 ) -> Result<Json<QueueSlackAlertResponse>, ApiError> {
-    let user_id = current_user_id(&headers)?;
+    let user_id = current_user_id(&pool, &headers).await?;
     let role = require_membership(&pool, user_id, organization_id).await?;
     if matches!(role, MemberRole::Viewer) {
         return Err(ApiError::forbidden("viewers cannot retry alert delivery"));
@@ -1634,7 +1892,7 @@ async fn create_remediation_task(
     Path((organization_id, finding_id)): Path<(Uuid, Uuid)>,
     Json(request): Json<CreateRemediationTaskRequest>,
 ) -> Result<Json<CreateRemediationTaskResponse>, ApiError> {
-    let user_id = current_user_id(&headers)?;
+    let user_id = current_user_id(&pool, &headers).await?;
     require_membership(&pool, user_id, organization_id).await?;
     let finding = require_finding_in_org(&pool, organization_id, finding_id).await?;
     let title = validate_task_title(
@@ -1679,7 +1937,7 @@ async fn list_remediation_tasks(
     headers: HeaderMap,
     Path(organization_id): Path<Uuid>,
 ) -> Result<Json<Vec<RemediationTask>>, ApiError> {
-    let user_id = current_user_id(&headers)?;
+    let user_id = current_user_id(&pool, &headers).await?;
     require_membership(&pool, user_id, organization_id).await?;
     let rows = sqlx::query(
         r#"
@@ -1703,7 +1961,7 @@ async fn update_remediation_status(
     Path((organization_id, task_id)): Path<(Uuid, Uuid)>,
     Json(request): Json<UpdateRemediationStatusRequest>,
 ) -> Result<Json<UpdateRemediationStatusResponse>, ApiError> {
-    let user_id = current_user_id(&headers)?;
+    let user_id = current_user_id(&pool, &headers).await?;
     require_membership(&pool, user_id, organization_id).await?;
     let row = sqlx::query(
         r#"
@@ -1753,7 +2011,7 @@ async fn list_audit_logs(
     headers: HeaderMap,
     Path(organization_id): Path<Uuid>,
 ) -> Result<Json<Vec<AuditLog>>, ApiError> {
-    let user_id = current_user_id(&headers)?;
+    let user_id = current_user_id(&pool, &headers).await?;
     require_membership(&pool, user_id, organization_id).await?;
     let rows = sqlx::query(
         r#"
@@ -2140,12 +2398,14 @@ async fn record_audit(
 }
 
 async fn require_user(pool: &PgPool, user_id: Uuid) -> Result<UserAccount, ApiError> {
-    let row = sqlx::query("SELECT id, email, display_name, created_at FROM users WHERE id = $1")
-        .bind(user_id)
-        .fetch_optional(pool)
-        .await
-        .map_err(map_sql_error)?
-        .ok_or_else(|| ApiError::unauthorized("user does not exist"))?;
+    let row = sqlx::query(
+        "SELECT id, email, display_name, email_verified_at, created_at FROM users WHERE id = $1",
+    )
+    .bind(user_id)
+    .fetch_optional(pool)
+    .await
+    .map_err(map_sql_error)?
+    .ok_or_else(|| ApiError::unauthorized("user does not exist"))?;
     Ok(user_from_row(&row))
 }
 
@@ -2244,7 +2504,7 @@ async fn find_user_by_email(
     email: &str,
 ) -> Result<Option<(UserAccount, String)>, ApiError> {
     let row = sqlx::query(
-        "SELECT id, email, display_name, password_hash, created_at FROM users WHERE email = $1",
+        "SELECT id, email, display_name, email_verified_at, password_hash, created_at FROM users WHERE email = $1",
     )
     .bind(email)
     .fetch_optional(pool)
@@ -2280,7 +2540,8 @@ async fn list_members(
 ) -> Result<Vec<OrganizationMember>, ApiError> {
     let rows = sqlx::query(
         r#"
-        SELECT users.id, users.email, users.display_name, users.created_at AS user_created_at,
+        SELECT users.id, users.email, users.display_name, users.email_verified_at,
+            users.created_at AS user_created_at,
             organization_members.role::text AS role,
             organization_members.created_at AS membership_created_at
         FROM organization_members
@@ -2355,6 +2616,7 @@ fn user_from_row(row: &PgRow) -> UserAccount {
         id: row.get("id"),
         email: row.get("email"),
         display_name: row.get("display_name"),
+        email_verified_at: row.get("email_verified_at"),
         created_at: row.get("created_at"),
     }
 }
@@ -2383,6 +2645,7 @@ fn organization_member_from_row(row: &PgRow) -> OrganizationMember {
             id: row.get("id"),
             email: row.get("email"),
             display_name: row.get("display_name"),
+            email_verified_at: row.get("email_verified_at"),
             created_at: row.get("user_created_at"),
         },
         role: parse_member_role(row.get("role")),
@@ -2649,43 +2912,79 @@ fn validate_scan_reason(input: Option<String>) -> Result<Option<String>, ApiErro
     validate_optional_text(input, "scan reason", 240)
 }
 
-fn enforce_auth_rate_limit(key: &str) -> Result<(), ApiError> {
-    const WINDOW_SECONDS: i64 = 60;
-    const MAX_ATTEMPTS: usize = 12;
-
-    static ATTEMPTS: OnceLock<Mutex<HashMap<String, VecDeque<chrono::DateTime<Utc>>>>> =
-        OnceLock::new();
-
-    let now = Utc::now();
-    let attempts = ATTEMPTS.get_or_init(|| Mutex::new(HashMap::new()));
-    let mut attempts = attempts.lock().map_err(|_| ApiError::internal())?;
-    let entries = attempts.entry(key.to_string()).or_default();
-    while let Some(oldest) = entries.front() {
-        if now.signed_duration_since(*oldest).num_seconds() > WINDOW_SECONDS {
-            entries.pop_front();
-        } else {
-            break;
-        }
-    }
-    if entries.len() >= MAX_ATTEMPTS {
+async fn enforce_auth_rate_limit(
+    pool: &PgPool,
+    bucket: &str,
+    key: &str,
+    window_seconds: i64,
+    max_attempts: i32,
+) -> Result<(), ApiError> {
+    let row = sqlx::query(
+        r#"
+        INSERT INTO auth_rate_limits (bucket, rate_key, window_start, attempts)
+        VALUES ($1, $2, now(), 1)
+        ON CONFLICT (bucket, rate_key)
+        DO UPDATE SET
+            window_start = CASE
+                WHEN auth_rate_limits.window_start < now() - ($3::text || ' seconds')::interval
+                    THEN now()
+                ELSE auth_rate_limits.window_start
+            END,
+            attempts = CASE
+                WHEN auth_rate_limits.window_start < now() - ($3::text || ' seconds')::interval
+                    THEN 1
+                ELSE auth_rate_limits.attempts + 1
+            END,
+            updated_at = now()
+        RETURNING attempts
+        "#,
+    )
+    .bind(bucket)
+    .bind(key)
+    .bind(window_seconds)
+    .fetch_one(pool)
+    .await
+    .map_err(map_sql_error)?;
+    let attempts: i32 = row.get("attempts");
+    if attempts > max_attempts {
         return Err(ApiError::too_many_requests(
             "too many authentication attempts; wait before retrying",
         ));
     }
-    entries.push_back(now);
     Ok(())
 }
 
-fn session_for_user(user_id: Uuid) -> Result<SessionToken, ApiError> {
+async fn session_for_user(pool: &PgPool, user_id: Uuid) -> Result<SessionToken, ApiError> {
     const SESSION_TTL_SECONDS: i64 = 60 * 60 * 8;
-    let access_token =
-        issue_session_token(user_id, session_secret().as_bytes(), SESSION_TTL_SECONDS)
-            .map_err(|_| ApiError::internal())?;
+    const REFRESH_AFTER_SECONDS: i64 = 60 * 45;
+
+    let session_id = Uuid::now_v7();
+    let access_token = issue_session_token(
+        user_id,
+        session_id,
+        session_secret().as_bytes(),
+        SESSION_TTL_SECONDS,
+    )
+    .map_err(|_| ApiError::internal())?;
+    sqlx::query(
+        r#"
+        INSERT INTO sessions (id, user_id, token_hash, expires_at)
+        VALUES ($1, $2, $3, $4)
+        "#,
+    )
+    .bind(session_id)
+    .bind(user_id)
+    .bind(hash_token(&access_token))
+    .bind(Utc::now() + Duration::seconds(SESSION_TTL_SECONDS))
+    .execute(pool)
+    .await
+    .map_err(map_sql_error)?;
 
     Ok(SessionToken {
         access_token,
         token_type: "Bearer".to_string(),
         expires_in_seconds: SESSION_TTL_SECONDS,
+        refresh_after_seconds: REFRESH_AFTER_SECONDS,
     })
 }
 
@@ -2700,7 +2999,10 @@ fn dev_seed_enabled() -> bool {
         .unwrap_or(false)
 }
 
-fn current_user_id(headers: &HeaderMap) -> Result<Uuid, ApiError> {
+async fn current_session(
+    pool: &PgPool,
+    headers: &HeaderMap,
+) -> Result<AuthenticatedSession, ApiError> {
     if let Some(value) = headers.get("authorization") {
         let value = value
             .to_str()
@@ -2711,17 +3013,113 @@ fn current_user_id(headers: &HeaderMap) -> Result<Uuid, ApiError> {
             ));
         };
 
-        return verify_session_token(token, session_secret().as_bytes())
-            .map_err(|_| ApiError::unauthorized("session token is invalid or expired"));
+        let verified = verify_session_token(token, session_secret().as_bytes())
+            .map_err(|_| ApiError::unauthorized("session token is invalid or expired"))?;
+        let row = sqlx::query(
+            r#"
+            UPDATE sessions
+            SET last_seen_at = now()
+            WHERE id = $1
+              AND user_id = $2
+              AND token_hash = $3
+              AND revoked_at IS NULL
+              AND expires_at > now()
+            RETURNING id
+            "#,
+        )
+        .bind(verified.session_id)
+        .bind(verified.user_id)
+        .bind(hash_token(token))
+        .fetch_optional(pool)
+        .await
+        .map_err(map_sql_error)?
+        .ok_or_else(|| ApiError::unauthorized("session token is revoked or expired"))?;
+
+        return Ok(AuthenticatedSession {
+            user_id: verified.user_id,
+            session_id: row.get("id"),
+        });
     }
 
+    if !dev_user_header_enabled() {
+        return Err(ApiError::unauthorized("authorization header is required"));
+    }
     let value = headers
         .get("x-ceem-user-id")
         .ok_or_else(|| ApiError::unauthorized("authorization header is required"))?;
     let value = value
         .to_str()
         .map_err(|_| ApiError::unauthorized("x-ceem-user-id must be a UUID"))?;
-    Uuid::parse_str(value).map_err(|_| ApiError::unauthorized("x-ceem-user-id must be a UUID"))
+    let user_id = Uuid::parse_str(value)
+        .map_err(|_| ApiError::unauthorized("x-ceem-user-id must be a UUID"))?;
+    Ok(AuthenticatedSession {
+        user_id,
+        session_id: Uuid::nil(),
+    })
+}
+
+async fn current_user_id(pool: &PgPool, headers: &HeaderMap) -> Result<Uuid, ApiError> {
+    Ok(current_session(pool, headers).await?.user_id)
+}
+
+async fn create_email_verification_token(pool: &PgPool, user_id: Uuid) -> Result<String, ApiError> {
+    const EMAIL_VERIFICATION_TTL_HOURS: i64 = 24;
+    let token = new_opaque_token();
+    sqlx::query(
+        r#"
+        INSERT INTO email_verification_tokens (id, user_id, token_hash, expires_at)
+        VALUES ($1, $2, $3, $4)
+        "#,
+    )
+    .bind(Uuid::now_v7())
+    .bind(user_id)
+    .bind(hash_token(&token))
+    .bind(Utc::now() + Duration::hours(EMAIL_VERIFICATION_TTL_HOURS))
+    .execute(pool)
+    .await
+    .map_err(map_sql_error)?;
+    Ok(token)
+}
+
+async fn create_password_reset_token(pool: &PgPool, user_id: Uuid) -> Result<String, ApiError> {
+    const PASSWORD_RESET_TTL_MINUTES: i64 = 30;
+    let token = new_opaque_token();
+    sqlx::query(
+        r#"
+        INSERT INTO password_reset_tokens (id, user_id, token_hash, expires_at)
+        VALUES ($1, $2, $3, $4)
+        "#,
+    )
+    .bind(Uuid::now_v7())
+    .bind(user_id)
+    .bind(hash_token(&token))
+    .bind(Utc::now() + Duration::minutes(PASSWORD_RESET_TTL_MINUTES))
+    .execute(pool)
+    .await
+    .map_err(map_sql_error)?;
+    Ok(token)
+}
+
+fn new_opaque_token() -> String {
+    format!("{}.{}", Uuid::now_v7(), Uuid::now_v7())
+}
+
+fn hash_token(token: &str) -> String {
+    let digest = Sha256::digest(token.as_bytes());
+    digest
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>()
+}
+
+fn dev_visible_token(token: String) -> Option<String> {
+    dev_seed_enabled().then_some(token)
+}
+
+fn dev_user_header_enabled() -> bool {
+    std::env::var("CEEM_ALLOW_DEV_USER_HEADER")
+        .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
 }
 
 fn member_role_slug(role: MemberRole) -> &'static str {
@@ -3044,10 +3442,22 @@ mod tests {
         );
     }
 
-    #[test]
-    fn allows_auth_rate_limit_under_threshold() {
+    #[tokio::test]
+    async fn allows_auth_rate_limit_under_threshold_when_database_is_available() {
+        let Ok(config) = DatabaseConfig::from_env() else {
+            return;
+        };
+        let repository = match PostgresRepository::connect(&config).await {
+            Ok(repository) => repository,
+            Err(_) => return,
+        };
+        repository.migrate().await.unwrap();
         let key = format!("rate-{}", Uuid::now_v7());
-        assert!(enforce_auth_rate_limit(&key).is_ok());
+        assert!(
+            enforce_auth_rate_limit(repository.pool(), "test", &key, 60, 2)
+                .await
+                .is_ok()
+        );
     }
 
     #[test]
